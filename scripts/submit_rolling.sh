@@ -69,8 +69,14 @@ SAVE_DIFF="${SAVE_DIFF:-0}"              # 1=保存 diff npy（需 ENABLE_EVAL=1
 SAVE_DIFF_NC="${SAVE_DIFF_NC:-0}"        # 1=保存 diff nc（需 ENABLE_EVAL=1）
 METRICS="${METRICS:-W-MAE W-RMSE}"
 
-# ---- 多卡分片：若需要多进程并行日期，使用 torchrun ----
+# ---- 多卡并行策略 ----
+# WORLD_SIZE:      并行进程数（默认 1=单进程）
+# PARALLEL_MODE:   auto | date | model
+#   auto  — 日期数 >= WORLD_SIZE 时按日期分片，否则按模型分片
+#   date  — 多日任务：18天 × WORLD_SIZE=8 → 每卡 2~3 天
+#   model — 单日任务：1天 × 4模型 × WORLD_SIZE=4 → 每卡 1 个模型
 WORLD_SIZE="${WORLD_SIZE:-1}"
+PARALLEL_MODE="${PARALLEL_MODE:-auto}"
 
 # ---- 打印运行信息 ----
 echo "=========================================="
@@ -191,10 +197,13 @@ if [ "${SAVE_DIFF_NC}" = "1" ]; then
     ARGS+=(--save-diff-nc)
 fi
 
+ARGS+=(--parallel-mode "${PARALLEL_MODE}")
+
+echo "[info] parallel_mode=${PARALLEL_MODE}  world_size=${WORLD_SIZE}"
 echo "[info] 开始时间: $(date)"
 
 if [ "${WORLD_SIZE}" -gt "1" ]; then
-    echo "[info] 多进程模式: WORLD_SIZE=${WORLD_SIZE}"
+    echo "[info] 多进程模式: WORLD_SIZE=${WORLD_SIZE}  PARALLEL_MODE=${PARALLEL_MODE}"
     torchrun \
         --nproc_per_node="${WORLD_SIZE}" \
         --master_port=29500 \

@@ -41,15 +41,42 @@ from zk_io.plot_utils import plot_compare
 
 
 def _progress(msg: str) -> None:
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    prefix = f"[rank{rank}/{world}]" if world > 1 else ""
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [rolling] {msg}", flush=True)
+    print(f"[{ts}] [rolling]{prefix} {msg}", flush=True)
 
 
 def _shard_dates(dates: List[str]) -> List[str]:
-    """按 RANK/WORLD_SIZE 分片日期（多卡分布式使用）。"""
+    """按 RANK/WORLD_SIZE 分片日期：rank i 处理 dates[i::world]。"""
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     return [d for i, d in enumerate(dates) if i % world == rank]
+
+
+def _shard_models(models: List[str]) -> List[str]:
+    """按 RANK/WORLD_SIZE 分片模型：rank i 处理 models[i::world]。
+    单日多模型并行时使用，每张卡独立推理一组模型。"""
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    assigned = [m for i, m in enumerate(models) if i % world == rank]
+    if not assigned:
+        _progress(f"无分配模型（共 {len(models)} 个模型，{world} 个 rank），退出")
+    return assigned
+
+
+def _decide_parallel_mode(mode: str, dates: List[str], models: List[str]) -> str:
+    """
+    决定并行策略：
+      date  — 每个 rank 处理不同日期（多日任务）
+      model — 每个 rank 处理不同模型（单日或模型多于日期时）
+      auto  — 自动判断：dates >= WORLD_SIZE → date；否则 → model
+    """
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if mode == "auto":
+        return "date" if len(dates) >= world else "model"
+    return mode
 
 
 def _load_data_source(source_name: str, data_cfg_path: Optional[Path] = None):
@@ -105,6 +132,7 @@ def run_rolling(
     metrics: Optional[List[str]] = None,
     models_cfg_path: Optional[Path] = None,
     data_cfg_path: Optional[Path] = None,
+    parallel_mode: str = "auto",
 ) -> None:
     """
     滚动推理主函数。
@@ -125,6 +153,10 @@ def run_rolling(
         save_diff:      是否保存 diff npy 文件（需 enable_eval=True）
         save_diff_nc:   是否保存 diff nc 文件（需 enable_eval=True）
         metrics:        指标列表（None=["W-MAE","W-RMSE"]）
+        parallel_mode:  多卡并行策略（auto | date | model）
+                          auto  — 日期数 >= WORLD_SIZE → date 模式；否则 → model 模式
+                          date  — 每 rank 处理不同日期（多日任务推荐）
+                          model — 每 rank 处理不同模型（单日多模型推荐）
     """
     if models_cfg_path is None:
         models_cfg_path = _ZK_ROOT / "config" / "models.yaml"
@@ -135,6 +167,25 @@ def run_rolling(
 
     n_steps = max_lead // lead_step
     leads = list(range(lead_step, max_lead + 1, lead_step))
+
+    # --- 解析日期（分片前先拿全量，供 auto 模式判断）---
+    all_dates = _parse_date_range(date_range)
+
+    # --- 决定并行策略 ---
+    pmode = _decide_parallel_mode(parallel_mode, all_dates, model_names)
+    _progress(f"并行模式: {pmode} (WORLD_SIZE={os.environ.get('WORLD_SIZE','1')})")
+
+    # --- 按策略分片 ---
+    if pmode == "model":
+        dates = all_dates                          # 每 rank 跑全部日期
+        model_names = _shard_models(model_names)  # 每 rank 只跑分配到的模型
+        if not model_names:
+            return
+    else:
+        dates = _shard_dates(all_dates)            # 每 rank 跑分配到的日期
+        if not dates:
+            _progress("当前 RANK 无分配日期，退出")
+            return
 
     # --- 加载模型 ---
     _progress(f"加载模型: {model_names}")
@@ -148,12 +199,6 @@ def run_rolling(
         use_monthly_subdir=src_cfg.get("use_monthly_subdir", False),
     )
 
-    # --- 解析日期 ---
-    dates = _parse_date_range(date_range)
-    dates = _shard_dates(dates)
-    if not dates:
-        _progress("当前 RANK 无分配日期，退出")
-        return
     _progress(f"处理日期: {dates}")
 
     for date in dates:

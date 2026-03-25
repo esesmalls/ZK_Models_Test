@@ -31,9 +31,21 @@
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
+
+# ---------------------------------------------------------------
+# 必须在任何 ROCm/CUDA 相关 import 之前设置每进程可见设备。
+# torchrun / srun 会注入 LOCAL_RANK；单进程时不做修改。
+# 参考主分支 GunDong_Infer/run_gundong_infer.py 的相同处理。
+# ---------------------------------------------------------------
+_local_rank = os.environ.get("LOCAL_RANK")
+if _local_rank is not None:
+    for _k in ("ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES",
+               "HIP_VISIBLE_DEVICES", "HSA_VISIBLE_DEVICES"):
+        os.environ[_k] = str(_local_rank)
+
+import argparse
 from pathlib import Path
 from typing import List, Optional
 
@@ -154,6 +166,16 @@ def main():
         help="推理设备",
     )
     ap.add_argument(
+        "--parallel-mode", default="auto",
+        choices=["auto", "date", "model"],
+        help=(
+            "多卡并行策略（需配合 torchrun/WORLD_SIZE 使用）:\n"
+            "  auto  — 日期数 >= WORLD_SIZE 时按日期分片，否则按模型分片\n"
+            "  date  — 每 rank 处理不同日期（18天×8卡 等多日场景）\n"
+            "  model — 每 rank 处理不同模型（单日×4模型×4卡 等场景）"
+        ),
+    )
+    ap.add_argument(
         "--models-config", type=Path,
         default=_ZK_ROOT / "config" / "models.yaml",
     )
@@ -204,6 +226,7 @@ def main():
             metrics=args.metrics,
             models_cfg_path=args.models_config,
             data_cfg_path=args.data_config,
+            parallel_mode=args.parallel_mode,
         )
 
 
