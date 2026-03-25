@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J gundong_240h
+#SBATCH -J gundong_fwfx_240h
 #SBATCH -p kshkexclu01
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
@@ -17,14 +17,16 @@ LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
 INPUT_ROOT="${INPUT_ROOT:-/public/share/aciwgvx1jd/20260324}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/public/share/aciwgvx1jd/GunDong_Infer_result}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-/public/share/aciwgvx1jd/GunDong_Infer_result_12h}"
 MAX_LEAD="${MAX_LEAD:-240}"
 LEAD_STEP="${LEAD_STEP:-6}"
-START_HOUR="${START_HOUR:-0}"
+START_HOUR="${START_HOUR:-12}"
 DEVICE="${DEVICE:-auto}"
-ONLY_MODELS="${ONLY_MODELS:-pangu,graphcast}"
+ONLY_MODELS="${ONLY_MODELS:-fengwu,fuxi}"
 DATE_FILTER="${DATE_FILTER:-}"
 SKIP_PLOTS="${SKIP_PLOTS:-0}"
+SINGLE_START_DATETIME="${SINGLE_START_DATETIME:-20260308T12}"
+FENGWU_MODEL_VERSION="${FENGWU_MODEL_VERSION:-v2}"
 
 echo "[info] job=${SLURM_JOB_ID:-na}"
 echo "[info] input=${INPUT_ROOT}"
@@ -48,21 +50,18 @@ export DGL_USE_GRAPHBOLT=0
 export DGL_LOAD_GRAPHBOLT=0
 export OMP_NUM_THREADS=16
 export HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+unset PYTHONPATH || true
 
 python -c "import torch; print('torch', torch.__version__, 'cuda?', torch.cuda.is_available())" || true
 python -c "import onnxruntime as ort; print('ORT providers:', ort.get_available_providers())" || true
 
 cd "${WORKDIR}"
 
-NPROC=${NPROC_PER_NODE:-8}
 EXTRA_ARGS=()
 if [ "${SKIP_PLOTS}" = "1" ]; then
   EXTRA_ARGS+=(--skip-plots)
 fi
-srun --nodes=1 --ntasks=1 torchrun \
-  --standalone \
-  --nproc_per_node="${NPROC}" \
-  "${PY_SCRIPT}" \
+srun --nodes=1 --ntasks=1 python "${PY_SCRIPT}" \
   --input-root "${INPUT_ROOT}" \
   --output-root "${OUTPUT_ROOT}" \
   --start-hour "${START_HOUR}" \
@@ -71,5 +70,7 @@ srun --nodes=1 --ntasks=1 torchrun \
   --device "${DEVICE}" \
   --only-models "${ONLY_MODELS}" \
   --date-filter "${DATE_FILTER}" \
-  "${EXTRA_ARGS[@]}"
+  --single-start-datetime "${SINGLE_START_DATETIME}" \
+  --fengwu-model-version "${FENGWU_MODEL_VERSION}" \
+  ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 

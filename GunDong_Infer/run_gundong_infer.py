@@ -7,7 +7,7 @@ import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pytz
@@ -28,8 +28,18 @@ GRAPH_ROOT = ZK_ROOT.parent
 sys.path.insert(0, str(ZK_ROOT))
 os.chdir(GRAPH_ROOT)
 
-from cepri_loader import PANGU_LEVELS, pack_pangu_onnx
-from infer_cepri_onnx import create_session, pangu_one_step, pick_providers
+from cepri_loader import FUXI_LEVELS, PANGU_LEVELS, specific_humidity_to_relative_humidity, pack_pangu_onnx
+from infer_cepri_onnx import (
+    build_fengwu_onnx_combo_input,
+    create_session,
+    fengwu_denorm_chw,
+    fengwu_normalize_for_onnx,
+    fuxi_prepare_onnx_input,
+    fuxi_temb,
+    pangu_one_step,
+    pick_providers,
+    unpack_fengwu_ort_outputs,
+)
 from onescience.datapipes.climate.utils.invariant import latlon_grid
 from onescience.datapipes.climate.utils.zenith_angle import cos_zenith_angle
 from onescience.models.graphcast.graph_cast_net import GraphCastNet
@@ -161,6 +171,290 @@ def _set_local_visible_device() -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = str(local_rank)
     os.environ["HIP_VISIBLE_DEVICES"] = str(local_rank)
     os.environ["HSA_VISIBLE_DEVICES"] = str(local_rank)
+
+
+def _parse_start_datetime(s: str) -> datetime:
+    if "T" not in s:
+        raise ValueError(f"invalid start datetime {s}, expected YYYYMMDDTHH")
+    d, h = s.split("T", 1)
+    if len(d) != 8 or len(h) != 2:
+        raise ValueError(f"invalid start datetime {s}, expected YYYYMMDDTHH")
+    return datetime(int(d[:4]), int(d[4:6]), int(d[6:8]), int(h), tzinfo=pytz.UTC)
+
+
+def _init_tag(dt: datetime) -> str:
+    return dt.strftime("%Y%m%dT%H")
+
+
+def _fwfx_surface_writer_paths(output_root: Path, model_dir_name: str, init_dt: datetime) -> Dict[str, Path]:
+    base = output_root / model_dir_name / "ERA5_6H"
+    tag = _init_tag(init_dt)
+    return {
+        "msl": base / f"msl_{tag}.npy",
+        "t2m": base / f"t2m_{tag}.npy",
+        "u10": base / f"u10_{tag}.npy",
+        "v10": base / f"v10_{tag}.npy",
+    }
+
+
+def _save_surface_stacks(paths: Dict[str, Path], stacks: Dict[str, List[np.ndarray]]) -> None:
+    for k, p in paths.items():
+        p.parent.mkdir(parents=True, exist_ok=True)
+        arr = np.stack(stacks[k], axis=0).astype(np.float32)
+        np.save(p, arr)
+
+
+def _plot_surface_compares(
+    *,
+    model_name: str,
+    out_dir: Path,
+    init_dt: datetime,
+    lead: int,
+    pred: Dict[str, np.ndarray],
+    truth_blob: Dict[str, np.ndarray] | None,
+) -> None:
+    tag = _init_tag(init_dt)
+    plot_dir = out_dir / "plots" / model_name / tag
+    plot_compare(
+        plot_dir / f"msl_compare_lead{lead:03d}.png",
+        pred["msl"],
+        None if truth_blob is None else truth_blob["surface_msl"],
+        title=f"{model_name} +{lead}h msl",
+        cmap="viridis",
+    )
+    plot_compare(
+        plot_dir / f"t2m_compare_lead{lead:03d}.png",
+        pred["t2m"],
+        None if truth_blob is None else truth_blob["surface_t2m"],
+        title=f"{model_name} +{lead}h t2m",
+        cmap="viridis",
+    )
+    plot_compare(
+        plot_dir / f"u10_compare_lead{lead:03d}.png",
+        pred["u10"],
+        None if truth_blob is None else truth_blob["surface_u10"],
+        title=f"{model_name} +{lead}h u10",
+        cmap="RdBu_r",
+    )
+    plot_compare(
+        plot_dir / f"v10_compare_lead{lead:03d}.png",
+        pred["v10"],
+        None if truth_blob is None else truth_blob["surface_v10"],
+        title=f"{model_name} +{lead}h v10",
+        cmap="RdBu_r",
+    )
+
+
+def _fengwu_69_from_blob_q_order(blob: Dict[str, np.ndarray]) -> np.ndarray:
+    # [u10,v10,t2m,msl,z(50..1000),q(50..1000),u(50..1000),v(50..1000),t(50..1000)]
+    levels_src = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+    order = [levels_src.index(int(lv)) for lv in FUXI_LEVELS]  # 50..1000
+    sfc = np.stack(
+        [blob["surface_u10"], blob["surface_v10"], blob["surface_t2m"], blob["surface_msl"]],
+        axis=0,
+    ).astype(np.float32)
+    z = blob["pangu_z"][order].astype(np.float32)
+    q = blob["pangu_q"][order].astype(np.float32)
+    u = blob["pangu_u"][order].astype(np.float32)
+    v = blob["pangu_v"][order].astype(np.float32)
+    t = blob["pangu_t"][order].astype(np.float32)
+    return np.concatenate([sfc, z, q, u, v, t], axis=0).astype(np.float32)
+
+
+def _fuxi_frame70_from_blob(blob: Dict[str, np.ndarray], *, tp_fill: float = 0.0) -> np.ndarray:
+    # FuXi order: Z13, T13, U13, V13, R13, T2M, U10, V10, MSL, TP
+    levels_src = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+    order = [levels_src.index(int(lv)) for lv in FUXI_LEVELS]  # 50..1000
+    z13 = blob["pangu_z"][order].astype(np.float32)
+    t13 = blob["pangu_t"][order].astype(np.float32)
+    u13 = blob["pangu_u"][order].astype(np.float32)
+    v13 = blob["pangu_v"][order].astype(np.float32)
+    q13 = blob["pangu_q"][order].astype(np.float32)
+    r13 = np.empty_like(q13, dtype=np.float32)
+    for i, lev in enumerate(FUXI_LEVELS):
+        r13[i] = specific_humidity_to_relative_humidity(q13[i], t13[i], float(lev))
+    s5 = np.stack(
+        [
+            blob["surface_t2m"],
+            blob["surface_u10"],
+            blob["surface_v10"],
+            blob["surface_msl"],
+            np.full_like(blob["surface_msl"], tp_fill, dtype=np.float32),
+        ],
+        axis=0,
+    ).astype(np.float32)
+    upper = np.concatenate([z13, t13, u13, v13, r13], axis=0)
+    return np.concatenate([upper, s5], axis=0).astype(np.float32)
+
+
+def _run_one_date_fengwu(
+    *,
+    date: str,
+    hour0: int,
+    lead_hours: Iterable[int],
+    data_root: Path,
+    output_root: Path,
+    providers,
+    skip_plots: bool,
+    model_version: str,
+    stats_dir: Optional[Path],
+) -> None:
+    onnx_p = ZK_ROOT / "fengwu" / f"fengwu_{model_version}.onnx"
+    if not onnx_p.is_file():
+        raise FileNotFoundError(onnx_p)
+    sess = create_session(onnx_p, providers)
+    inps = sess.get_inputs()
+    if len(inps) != 1:
+        raise RuntimeError("fengwu expects single tensor input")
+
+    start_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), hour0, tzinfo=pytz.UTC)
+    tag = _init_tag(start_dt)
+    n_leads = len(list(lead_hours))
+    surfaces: Dict[str, List[np.ndarray]] = {k: [] for k in ("msl", "t2m", "u10", "v10")}
+
+    # Build semantic +6 first lead input by using (t-6h, t0) for 138-ch models.
+    exp_c = sess.get_inputs()[0].shape[1]
+    if isinstance(exp_c, int) and exp_c == 138:
+        prev_dt = start_dt - timedelta(hours=6)
+        b_prev = load_time_blob(data_root, prev_dt.strftime("%Y%m%d"), prev_dt.hour)
+        b_now = load_time_blob(data_root, date, hour0)
+        x = np.concatenate([_fengwu_69_from_blob_q_order(b_prev), _fengwu_69_from_blob_q_order(b_now)], axis=0)[
+            np.newaxis, ...
+        ].astype(np.float32)
+    else:
+        # 37-level single-frame path is not available in data_adapter_20260324 layout.
+        x = build_fengwu_onnx_combo_input(data_root, date, hour0, sess)
+
+    normalized = False
+    if stats_dir is not None:
+        x = fengwu_normalize_for_onnx(x, stats_dir)
+        normalized = True
+    cur = x.astype(np.float32)
+
+    for i, lead in enumerate(lead_hours, start=1):
+        outs = sess.run(None, {inps[0].name: cur})
+        surf_o, _, _, _, _, _ = unpack_fengwu_ort_outputs(outs)
+        pred69 = None
+        if len(outs) == 1:
+            yo = np.asarray(outs[0], dtype=np.float32)
+            while yo.ndim > 3 and yo.shape[0] == 1:
+                yo = yo[0]
+            if yo.ndim == 3 and yo.shape[0] >= 69:
+                pred69 = yo[:69]
+        if pred69 is not None and normalized and stats_dir is not None:
+            pred69 = fengwu_denorm_chw(pred69, stats_dir)
+            surf_o = pred69[:4]
+
+        pred = {
+            "u10": np.asarray(surf_o[0], dtype=np.float32),
+            "v10": np.asarray(surf_o[1], dtype=np.float32),
+            "t2m": np.asarray(surf_o[2], dtype=np.float32),
+            "msl": np.asarray(surf_o[3], dtype=np.float32),
+        }
+        for k in surfaces:
+            surfaces[k].append(pred[k])
+
+        valid_dt = start_dt + timedelta(hours=int(lead))
+        truth = load_truth_blob_for_valid_time(data_root, valid_dt)
+        if not skip_plots:
+            _plot_surface_compares(
+                model_name="fengwu",
+                out_dir=output_root,
+                init_dt=start_dt,
+                lead=int(lead),
+                pred=pred,
+                truth_blob=truth,
+            )
+
+        # autoregressive update
+        if cur.shape[1] == 138 and pred69 is not None:
+            if normalized and stats_dir is not None:
+                pred69_norm = fengwu_normalize_for_onnx(pred69[np.newaxis, ...], stats_dir)[0]
+            else:
+                pred69_norm = pred69
+            cur = np.concatenate([cur[:, 69:], pred69_norm[np.newaxis, ...]], axis=1).astype(np.float32)
+        elif len(outs) == 1 and isinstance(np.asarray(outs[0]).shape[1] if np.asarray(outs[0]).ndim > 1 else None, int):
+            ny = np.asarray(outs[0], dtype=np.float32)
+            if ny.shape == cur.shape:
+                cur = ny.astype(np.float32)
+        if i % 8 == 0 or i == 1:
+            _progress(f"[fengwu] {tag} lead={lead}h done")
+
+    paths = _fwfx_surface_writer_paths(output_root, "FengWu", start_dt)
+    _save_surface_stacks(paths, surfaces)
+
+
+def _run_one_date_fuxi(
+    *,
+    date: str,
+    hour0: int,
+    lead_hours: Iterable[int],
+    data_root: Path,
+    output_root: Path,
+    providers,
+    skip_plots: bool,
+) -> None:
+    onnx_p = ZK_ROOT / "fuxi" / "short.onnx"
+    if not onnx_p.is_file():
+        raise FileNotFoundError(onnx_p)
+    sess = create_session(onnx_p, providers)
+
+    # Match zforecast semantics: two frames are t-6h and t0.
+    prev_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), hour0, tzinfo=pytz.UTC) - timedelta(hours=6)
+    b_prev = load_time_blob(data_root, prev_dt.strftime("%Y%m%d"), prev_dt.hour)
+    b_now = load_time_blob(data_root, date, hour0)
+    raw = np.stack([_fuxi_frame70_from_blob(b_prev), _fuxi_frame70_from_blob(b_now)], axis=0).astype(np.float32)
+    x, layout = fuxi_prepare_onnx_input(raw, sess)
+    cur = x.astype(np.float32)
+
+    start_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), hour0, tzinfo=pytz.UTC)
+    tag = _init_tag(start_dt)
+    surfaces: Dict[str, List[np.ndarray]] = {k: [] for k in ("msl", "t2m", "u10", "v10")}
+
+    for i, lead in enumerate(lead_hours, start=1):
+        feeds = {}
+        for inp in sess.get_inputs():
+            if "temb" in inp.name.lower():
+                feeds[inp.name] = fuxi_temb(int(lead))
+            else:
+                feeds[inp.name] = cur
+        y = sess.run(None, feeds)[0]
+        cur = y.astype(np.float32)
+        if y.ndim == 5 and layout == "NTCHW":
+            out_latest = y[0, -1]
+        elif y.ndim == 5 and layout == "NCTHW":
+            out_latest = y[0, :, -1]
+        elif y.ndim == 4:
+            out_latest = y[0]
+        else:
+            raise RuntimeError(f"unexpected fuxi output shape: {y.shape}")
+
+        # FuXi channel order: ... T2M(65), U10(66), V10(67), MSL(68), TP(69)
+        pred = {
+            "t2m": np.asarray(out_latest[65], dtype=np.float32),
+            "u10": np.asarray(out_latest[66], dtype=np.float32),
+            "v10": np.asarray(out_latest[67], dtype=np.float32),
+            "msl": np.asarray(out_latest[68], dtype=np.float32),
+        }
+        for k in surfaces:
+            surfaces[k].append(pred[k])
+
+        valid_dt = start_dt + timedelta(hours=int(lead))
+        truth = load_truth_blob_for_valid_time(data_root, valid_dt)
+        if not skip_plots:
+            _plot_surface_compares(
+                model_name="fuxi",
+                out_dir=output_root,
+                init_dt=start_dt,
+                lead=int(lead),
+                pred=pred,
+                truth_blob=truth,
+            )
+        if i % 8 == 0 or i == 1:
+            _progress(f"[fuxi] {tag} lead={lead}h done")
+
+    paths = _fwfx_surface_writer_paths(output_root, "FuXi", start_dt)
+    _save_surface_stacks(paths, surfaces)
 
 
 def _run_one_date_pangu(
@@ -337,16 +631,24 @@ def main() -> None:
     ap.add_argument("--max-lead-hours", type=int, default=240)
     ap.add_argument("--lead-step-hours", type=int, default=6)
     ap.add_argument("--device", default="auto", choices=["auto", "dcu", "cuda", "cpu"])
-    ap.add_argument("--only-models", default="", help="comma list: pangu,graphcast")
+    ap.add_argument("--only-models", default="", help="comma list: pangu,graphcast,fengwu,fuxi")
     ap.add_argument("--date-filter", default="", help="comma list dates yyyymmdd")
     ap.add_argument("--skip-plots", action="store_true", help="only write nc, do not generate plots")
+    ap.add_argument("--single-start-datetime", default="", help="run one init: YYYYMMDDTHH (overrides date-filter/start-hour)")
+    ap.add_argument("--fengwu-model-version", default="v2", choices=["v1", "v2"])
+    ap.add_argument("--fengwu-stats-dir", type=Path, default=ZK_ROOT / "fengwu")
     args = ap.parse_args()
 
     _set_local_visible_device()
-    dates = list_available_dates(args.input_root)
-    if args.date_filter.strip():
-        want = {x.strip() for x in args.date_filter.split(",") if x.strip()}
-        dates = [d for d in dates if d in want]
+    if args.single_start_datetime.strip():
+        sdt = _parse_start_datetime(args.single_start_datetime.strip())
+        dates = [sdt.strftime("%Y%m%d")]
+        args.start_hour = int(sdt.hour)
+    else:
+        dates = list_available_dates(args.input_root)
+        if args.date_filter.strip():
+            want = {x.strip() for x in args.date_filter.split(",") if x.strip()}
+            dates = [d for d in dates if d in want]
     dates = _shard_dates(dates)
     if not dates:
         _progress("no assigned dates, exit")
@@ -356,6 +658,8 @@ def main() -> None:
     only = {x.strip().lower() for x in args.only_models.split(",") if x.strip()}
     run_pangu = (not only) or ("pangu" in only)
     run_graphcast = (not only) or ("graphcast" in only)
+    run_fengwu = (not only) or ("fengwu" in only)
+    run_fuxi = (not only) or ("fuxi" in only)
 
     providers = pick_providers(args.device)
     _progress(f"providers={providers}")
@@ -400,6 +704,30 @@ def main() -> None:
                 skip_plots=args.skip_plots,
             )
             _progress(f"{init_tag} graphcast done")
+        if run_fengwu:
+            _run_one_date_fengwu(
+                date=d,
+                hour0=args.start_hour,
+                lead_hours=leads,
+                data_root=args.input_root,
+                output_root=Path("/public/share/aciwgvx1jd/GunDong_Infer_result_12h"),
+                providers=providers,
+                skip_plots=args.skip_plots,
+                model_version=args.fengwu_model_version,
+                stats_dir=args.fengwu_stats_dir,
+            )
+            _progress(f"{init_tag} fengwu done")
+        if run_fuxi:
+            _run_one_date_fuxi(
+                date=d,
+                hour0=args.start_hour,
+                lead_hours=leads,
+                data_root=args.input_root,
+                output_root=Path("/public/share/aciwgvx1jd/GunDong_Infer_result_12h"),
+                providers=providers,
+                skip_plots=args.skip_plots,
+            )
+            _progress(f"{init_tag} fuxi done")
         _progress(f"finished {init_tag}")
 
 

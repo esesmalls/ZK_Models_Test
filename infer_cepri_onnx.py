@@ -6,7 +6,7 @@ ONNX inference for ZK_Models (Pangu / Fengwu / Fuxi) using CEPRI ERA5 NetCDF.
 在原本使用 3h 模型的步上用 **1h 模型** 代替（与官方复合步长略有差异，仅作联调用）。
 
 建议在 **DCU 计算节点** 上运行：加载 `compiler/dtk/25.04` 后，若安装了带 ROCm/MIGraphX 的
-onnxruntime，将自动优先使用；否则回退 CPU（大模型可能极慢或缺少算子）。
+onnxruntime，将自动优先使用；若缺少对应 EP，默认直接报错退出（避免误回退 CPU）。
 
 推荐环境：`conda activate torch2.4_dtk25.04_cp310_e2s`（与 graphcast / e2s 脚本一致）。
 """
@@ -300,7 +300,7 @@ def _session_options() -> ort.SessionOptions:
     return o
 
 
-def pick_providers(device: str) -> List[Any]:
+def pick_providers(device: str, allow_cpu_fallback: bool = False) -> List[Any]:
     """device: auto | dcu | cuda | cpu"""
     avail = set(ort.get_available_providers())
     if device == "cpu":
@@ -308,15 +308,25 @@ def pick_providers(device: str) -> List[Any]:
     if device == "cuda":
         if "CUDAExecutionProvider" in avail:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        print("警告: 未检测到 CUDAExecutionProvider，改用 CPU。", file=sys.stderr)
+        if not allow_cpu_fallback:
+            raise RuntimeError(
+                "未检测到 CUDAExecutionProvider。"
+                " 若确认需要回退 CPU，请显式添加 --allow-cpu-fallback。"
+            )
+        print("警告: 未检测到 CUDAExecutionProvider，按要求回退 CPU。", file=sys.stderr)
         return ["CPUExecutionProvider"]
     if device == "dcu":
         for p in ("ROCMExecutionProvider", "MIGraphXExecutionProvider"):
             if p in avail:
                 return [p, "CPUExecutionProvider"]
+        if not allow_cpu_fallback:
+            raise RuntimeError(
+                "当前 onnxruntime 无 ROCM/MIGraphX EP；DCU 上请安装对应 onnxruntime 构建或使用 PyTorch 路径。"
+                " 若确认需要回退 CPU，请显式添加 --allow-cpu-fallback。"
+            )
         print(
             "警告: 当前 onnxruntime 无 ROCM/MIGraphX EP；DCU 上请安装对应 onnxruntime 构建或使用 PyTorch 路径。"
-            " 现回退 CPU。",
+            " 按要求回退 CPU。",
             file=sys.stderr,
         )
         return ["CPUExecutionProvider"]
@@ -468,7 +478,7 @@ def build_fengwu_onnx_combo_input(
 ) -> np.ndarray:
     """
     189：单帧 4+37×5（与 onescience Fengwu pressure_level=37 一致），取 `--hour` 对应整点分析场。
-    138：两帧各 69=4+13×5，较早时刻在前 [h, h+1]（裁剪到同日 0–23 时）。
+    138：两帧各 69=4+13×5，较早时刻在前 [h, h+6]（裁剪到同日 0–23 时）。
     """
     exp = _fengwu_expected_combo_channels(sess)
     if exp is None or exp == 189:
@@ -487,7 +497,7 @@ def build_fengwu_onnx_combo_input(
         ).astype(np.float32)
     if exp == 138:
         h0 = int(max(0, min(23, hour)))
-        h_prev, h_curr = h0, int(min(23, h0 + 1))
+        h_prev, h_curr = h0, int(min(23, h0 + 6))
         b_prev = load_cepri_time(era5_root, date_yyyymmdd, h_prev)
         b_curr = load_cepri_time(era5_root, date_yyyymmdd, h_curr)
         a = _fengwu_69_from_blob_q_order(b_prev)
@@ -634,6 +644,11 @@ def main() -> None:
     p.add_argument("--device", default="auto", choices=["auto", "dcu", "cuda", "cpu"])
     p.add_argument("--output-dir", default=None)
     p.add_argument(
+        "--allow-cpu-fallback",
+        action="store_true",
+        help="当目标设备 EP 缺失时允许回退 CPU（默认关闭；DCU/CUDA 场景默认 fail-fast）",
+    )
+    p.add_argument(
         "--stats-dir",
         default=None,
         help="Fuxi 可选：含 global_means.npy / global_stds.npy（与 ERA5HDF5Datapipe 一致）",
@@ -658,7 +673,7 @@ def main() -> None:
     args = p.parse_args()
 
     era5_root = Path(args.era5_root)
-    providers = pick_providers(args.device)
+    providers = pick_providers(args.device, allow_cpu_fallback=bool(args.allow_cpu_fallback))
     print("onnxruntime providers:", ort.get_available_providers())
     print("using:", providers)
 

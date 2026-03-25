@@ -8,7 +8,7 @@
 
 出图变量：地面 u10,v10,t2m,msl + 1000hPa 的 z,q,u,v,t；对比图 `*_compare.png` 三联（英文子图标题避免乱码）。
 Fengwu/Fuxi 在 1000hPa 用相对湿度 r（非比湿 q）；对比时与 ERA5 由 q,T 推算的 RH 对齐。
-GraphCast/Pangu 仍按 `--hour` 起报。Fengwu：189 通道取当小时分析场；138 双帧为 **(h,h+1)**。
+GraphCast/Pangu 仍按 `--hour` 起报。Fengwu：189 通道取当小时分析场；138 双帧为 **(h,h+6)**。
 Fuxi short 两帧为 **(h,h+1)**，时间嵌入为简易 `fuxi_temb`。
 对比图：`--fengwu-compare-lead-hours` / `--fuxi-compare-lead-hours`（默认 6）相对 `--hour` 起报时刻取同期 ERA5。
 `--no-compare` 可关闭对比图。
@@ -826,7 +826,7 @@ def main() -> None:
         "--hour",
         type=int,
         default=0,
-        help="GraphCast/Pangu / Fengwu(189) / 对比锚点起报整点；Fuxi 与 Fengwu(138) 第二帧为 min(h+1,23)",
+        help="GraphCast/Pangu / Fengwu(189) / 对比锚点起报整点；Fuxi 第二帧为 min(h+1,23)，Fengwu(138) 第二帧为 min(h+6,23)",
     )
     ap.add_argument("--num-steps", type=int, default=3)
     ap.add_argument(
