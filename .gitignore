@@ -1,0 +1,27 @@
+# 模型与数据（不进库）
+*.onnx
+*.zip
+*.npy
+*.npz
+*.h5
+*.hdf5
+
+# 运行产物
+logs/
+results/
+*.png
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+
+# 工具 / IDE
+.DS_Store
+*.swp
+.idea/
