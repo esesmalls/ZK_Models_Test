@@ -44,11 +44,15 @@ def _make_lat_weights(lats: np.ndarray) -> Tuple[np.ndarray, float]:
 # ------------------------------------------------------------------ #
 
 def _w_mae(diff: np.ndarray, w2d: np.ndarray, sum_w: float) -> float:
-    return float(np.nansum(np.abs(diff) * w2d) / sum_w)
+    # w2d shape (H,1) 广播到 diff shape (H,W)；分母必须对应相同的 H×W 总权重，
+    # 与主分支 evaluate_models.py 的 broadcast_to(H,W) 后 nansum 一致。
+    w_bc = np.broadcast_to(w2d, diff.shape)
+    return float(np.nansum(np.abs(diff) * w_bc) / np.nansum(w_bc))
 
 
 def _w_rmse(diff: np.ndarray, w2d: np.ndarray, sum_w: float) -> float:
-    return float(np.sqrt(np.nansum((diff ** 2) * w2d) / sum_w))
+    w_bc = np.broadcast_to(w2d, diff.shape)
+    return float(np.sqrt(np.nansum((diff ** 2) * w_bc) / np.nansum(w_bc)))
 
 
 # 注册表：指标名 → 计算函数(diff, w2d, sum_w) → float

@@ -179,6 +179,26 @@ class GraphCastModel(WeatherModel):
             extra={"forecast_time": ft + timedelta(hours=self._step_h)},
         )
 
+    def unload(self) -> None:
+        """将 PyTorch 模型移回 CPU 并删除，释放 GPU 显存。"""
+        import gc
+        if self._model is not None:
+            try:
+                self._model.cpu()
+            except Exception:
+                pass
+            del self._model
+            self._model = None
+        self._static_data = None
+        self._latlon_torch = None
+        self._loaded = False
+        gc.collect()
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
     def get_surface_var_names(self) -> List[str]:
         mapping = {
             "10m_u_component_of_wind": "u10",

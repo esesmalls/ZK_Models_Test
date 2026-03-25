@@ -85,6 +85,13 @@ class WeatherModel(ABC):
     # 可选覆盖
     # ------------------------------------------------------------------
 
+    def unload(self) -> None:
+        """
+        释放模型占用的 GPU/CPU 内存（ONNX Session 或 PyTorch Module）。
+        默认为空操作；各模型子类应覆盖此方法以实际释放资源。
+        在多模型串行推理时，每个模型推理完毕后调用，避免 VRAM OOM。
+        """
+
     def is_loaded(self) -> bool:
         return hasattr(self, "_loaded") and self._loaded
 

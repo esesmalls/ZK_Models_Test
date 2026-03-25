@@ -72,6 +72,13 @@ class PanguModel(WeatherModel):
             lead=next_lead,
         )
 
+    def unload(self) -> None:
+        """释放所有 ONNX Session，归还 GPU/CPU 显存。"""
+        import gc
+        self._sessions.clear()
+        self._loaded = False
+        gc.collect()
+
     def get_surface_var_names(self) -> List[str]:
         return ["msl", "u10", "v10", "t2m"]
 

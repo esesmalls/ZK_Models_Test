@@ -107,6 +107,13 @@ class FuXiModel(WeatherModel):
             extra={"layout": layout},
         )
 
+    def unload(self) -> None:
+        """释放 ONNX Session，归还 GPU 显存。"""
+        import gc
+        self._sess = None
+        self._loaded = False
+        gc.collect()
+
     def get_surface_var_names(self) -> List[str]:
         return ["t2m", "u10", "v10", "msl"]
 

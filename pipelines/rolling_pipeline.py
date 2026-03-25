@@ -177,21 +177,17 @@ def run_rolling(
 
     # --- 按策略分片 ---
     if pmode == "model":
-        dates = all_dates                          # 每 rank 跑全部日期
-        model_names = _shard_models(model_names)  # 每 rank 只跑分配到的模型
+        dates = all_dates
+        model_names = _shard_models(model_names)
         if not model_names:
             return
     else:
-        dates = _shard_dates(all_dates)            # 每 rank 跑分配到的日期
+        dates = _shard_dates(all_dates)
         if not dates:
             _progress("当前 RANK 无分配日期，退出")
             return
 
-    # --- 加载模型 ---
-    _progress(f"加载模型: {model_names}")
-    registry = build_registry(models_cfg_path, device=device, only=model_names)
-
-    # --- 加载数据适配器 ---
+    # --- 加载数据适配器（轻量，无 VRAM 占用，一次性初始化）---
     data_root, data_fmt, src_cfg = _load_data_source(data_source, data_cfg_path)
     _progress(f"数据源: {data_root}（格式: {data_fmt or '自动探测'}）")
     adapter = get_adapter(
@@ -199,158 +195,164 @@ def run_rolling(
         use_monthly_subdir=src_cfg.get("use_monthly_subdir", False),
     )
 
-    _progress(f"处理日期: {dates}")
+    _progress(f"处理日期: {dates}  模型: {model_names}")
 
-    for date in dates:
-        init_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), init_hour)
-        init_tag = init_dt.strftime("%Y%m%dT%H")
-        _progress(f"开始处理 {init_tag}")
+    # ---------------------------------------------------------------
+    # 外层循环：模型；内层循环：日期
+    # 每个模型独占一次 VRAM：加载 → 跑完所有日期 → 卸载 → 下一个模型
+    # 避免多模型同时占用 VRAM 导致 OOM。
+    # ---------------------------------------------------------------
+    for model_name in model_names:
+        display_name = {
+            "pangu": "PanGu", "fengwu": "FengWu",
+            "fuxi": "FuXi", "graphcast": "GraphCast",
+        }.get(model_name.lower(), model_name)
 
-        # 加载起报 blob
-        try:
-            init_blob = adapter.load_blob(date, init_hour)
-        except FileNotFoundError as e:
-            _progress(f"跳过 {init_tag}：{e}")
+        # 逐模型加载
+        _progress(f"[{display_name}] 加载模型权重...")
+        registry = build_registry(models_cfg_path, device=device, only=[model_name])
+        if model_name not in registry:
+            _progress(f"[{display_name}] 加载失败，跳过")
             continue
+        model = registry.get(model_name)
+        sfc_vars = variables if variables else model.get_surface_var_names()
+        step_h = model.get_step_hours()
+        is_pangu = model_name.lower() == "pangu"
 
-        prev_dt = init_dt - timedelta(hours=lead_step)
-        prev_blob = adapter.load_blob_safe(prev_dt.strftime("%Y%m%d"), prev_dt.hour)
+        try:
+            for date in dates:
+                init_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), init_hour)
+                init_tag = init_dt.strftime("%Y%m%dT%H")
 
-        lat = init_blob.get("lat", np.linspace(90.0, -90.0, 721, dtype=np.float32))
-        lon = init_blob.get("lon", np.arange(0.0, 360.0, 0.25, dtype=np.float32))
+                # 加载起报 blob
+                try:
+                    init_blob = adapter.load_blob(date, init_hour)
+                except FileNotFoundError as e:
+                    _progress(f"[{display_name}] 跳过 {init_tag}：{e}")
+                    continue
 
-        # eval 输出目录
-        eval_out_dir = Path(output_root) / f"eval_{max_lead}h_{init_tag}"
+                prev_dt = init_dt - timedelta(hours=lead_step)
+                prev_blob = adapter.load_blob_safe(prev_dt.strftime("%Y%m%d"), prev_dt.hour)
 
-        for model_name in model_names:
-            if model_name not in registry:
-                _progress(f"模型 {model_name} 未加载，跳过")
-                continue
+                lat = init_blob.get("lat", np.linspace(90.0, -90.0, 721, dtype=np.float32))
+                lon = init_blob.get("lon", np.arange(0.0, 360.0, 0.25, dtype=np.float32))
+                eval_out_dir = Path(output_root) / f"eval_{max_lead}h_{init_tag}"
 
-            model = registry.get(model_name)
-            sfc_vars = variables if variables else model.get_surface_var_names()
-            step_h = model.get_step_hours()
+                _progress(f"[{display_name}] 开始滚动推理 {init_tag}，步长={step_h}h，共 {n_steps} 步")
 
-            # PanGu 使用特殊 NPY 命名（加 _surface_ 后缀）
-            is_pangu = model_name.lower() == "pangu"
-            display_name = {
-                "pangu": "PanGu", "fengwu": "FengWu",
-                "fuxi": "FuXi", "graphcast": "GraphCast",
-            }.get(model_name.lower(), model_name)
+                # 初始化模型状态
+                try:
+                    state = model.init_state(init_blob, prev_blob=prev_blob, init_dt=init_dt)
+                except ValueError as e:
+                    _progress(f"[{display_name}] init_state 失败: {e}")
+                    continue
 
-            _progress(f"[{display_name}] 开始滚动推理 {init_tag}，步长={step_h}h，共 {n_steps} 步")
+                # 初始化 MetricsAccumulator（每个 init_tag 独立）
+                acc = None
+                valid_times_map: Dict[Tuple[str, str], List] = {}
+                if enable_eval:
+                    acc = MetricsAccumulator(
+                        lats=lat,
+                        metrics=metrics,
+                        save_diff=save_diff,
+                        save_diff_nc=save_diff_nc,
+                    )
+                    for var in sfc_vars:
+                        valid_times_map[(display_name, var)] = []
 
-            # 初始化模型状态
-            try:
-                state = model.init_state(init_blob, prev_blob=prev_blob, init_dt=init_dt)
-            except ValueError as e:
-                _progress(f"[{display_name}] init_state 失败: {e}")
-                continue
+                # NPY 写出器
+                with NpyStackWriter(
+                    output_root=Path(output_root),
+                    model_name=display_name,
+                    init_tag=init_tag,
+                    variables=sfc_vars,
+                    n_steps=n_steps,
+                    shape_hw=(len(lat), len(lon)),
+                    pangu_suffix=is_pangu,
+                ) as npy_writer:
 
-            # 初始化 MetricsAccumulator
-            acc = None
-            valid_times_map: Dict[Tuple[str, str], List] = {}
-            if enable_eval:
-                acc = MetricsAccumulator(
-                    lats=lat,
-                    metrics=metrics,
-                    save_diff=save_diff,
-                    save_diff_nc=save_diff_nc,
-                )
-                for var in sfc_vars:
-                    valid_times_map[(display_name, var)] = []
+                    for si, lead in enumerate(leads):
+                        steps_needed = lead_step // step_h
+                        for _ in range(steps_needed):
+                            state = model.step(state)
 
-            # NPY 写出器
-            with NpyStackWriter(
-                output_root=Path(output_root),
-                model_name=display_name,
-                init_tag=init_tag,
-                variables=sfc_vars,
-                n_steps=n_steps,
-                shape_hw=(len(lat), len(lon)),
-                pangu_suffix=is_pangu,
-            ) as npy_writer:
+                        current_lead = state.lead
+                        valid_dt = init_dt + timedelta(hours=current_lead)
+                        truth_blob = adapter.load_blob_for_valid_time(valid_dt)
 
-                for si, lead in enumerate(leads):
-                    # 模型步进（注意：若 step_h != lead_step，需多步）
-                    steps_needed = lead_step // step_h
-                    for _ in range(steps_needed):
-                        state = model.step(state)
+                        pred_sfc = extract_surface_vars(state.blob, sfc_vars)
+                        npy_writer.write_step(si, pred_sfc)
 
-                    current_lead = state.lead
-                    valid_dt = init_dt + timedelta(hours=current_lead)
-                    truth_blob = adapter.load_blob_for_valid_time(valid_dt)
-
-                    # 提取地表变量
-                    pred_sfc = extract_surface_vars(state.blob, sfc_vars)
-                    npy_writer.write_step(si, pred_sfc)
-
-                    # NC 写出（Pangu/GraphCast 等需要完整场的情况）
-                    if save_nc:
-                        nc_dir = Path(output_root) / init_tag / "nc" / model_name.lower()
-                        vars_2d = {f"sfc_{k}": v for k, v in pred_sfc.items()}
-                        # 气压场若存在也写入
-                        vars_3d = None
-                        level_vals = None
-                        if model.get_pressure_var_names():
-                            from cepri_loader import PANGU_LEVELS
-                            vars_3d = {}
-                            for pv in model.get_pressure_var_names():
-                                bkey = f"pangu_{pv}"
-                                if bkey in state.blob:
-                                    vars_3d[f"pres_{pv}"] = state.blob[bkey]
-                            level_vals = np.asarray(PANGU_LEVELS, dtype=np.float32) if vars_3d else None
-                        write_step_nc(
-                            nc_dir / f"lead_{current_lead:03d}.nc",
-                            model=display_name,
-                            init_time=init_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            lead_hours=current_lead,
-                            valid_time=valid_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                            vars_2d=vars_2d,
-                            vars_3d=vars_3d if vars_3d else None,
-                            level_values=level_vals,
-                            lat=lat,
-                            lon=lon,
-                        )
-
-                    # 对比图
-                    if not skip_plots:
-                        truth_sfc = extract_surface_vars(truth_blob, sfc_vars) if truth_blob else None
-                        plot_dir = Path(output_root) / "plots" / model_name.lower() / init_tag
-                        for var_name, pred_arr in pred_sfc.items():
-                            truth_arr = truth_sfc.get(var_name) if truth_sfc else None
-                            plot_compare(
-                                plot_dir / f"{var_name}_lead{current_lead:03d}.png",
-                                pred_arr,
-                                truth_arr,
-                                title=f"{display_name} +{current_lead}h {var_name} | {init_tag}",
-                                cmap="RdBu_r" if var_name in ("u10", "v10") else "viridis",
+                        # NC 写出
+                        if save_nc:
+                            nc_dir = Path(output_root) / init_tag / "nc" / model_name.lower()
+                            vars_2d = {f"sfc_{k}": v for k, v in pred_sfc.items()}
+                            vars_3d = None
+                            level_vals = None
+                            if model.get_pressure_var_names():
+                                from cepri_loader import PANGU_LEVELS
+                                vars_3d = {}
+                                for pv in model.get_pressure_var_names():
+                                    bkey = f"pangu_{pv}"
+                                    if bkey in state.blob:
+                                        vars_3d[f"pres_{pv}"] = state.blob[bkey]
+                                level_vals = np.asarray(PANGU_LEVELS, dtype=np.float32) if vars_3d else None
+                            write_step_nc(
+                                nc_dir / f"lead_{current_lead:03d}.nc",
+                                model=display_name,
+                                init_time=init_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                lead_hours=current_lead,
+                                valid_time=valid_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                                vars_2d=vars_2d,
+                                vars_3d=vars_3d if vars_3d else None,
+                                level_values=level_vals,
+                                lat=lat,
+                                lon=lon,
                             )
 
-                    # 内嵌评估
-                    if acc is not None and truth_blob is not None:
-                        truth_sfc_eval = extract_surface_vars(truth_blob, sfc_vars)
-                        for var_name, pred_arr in pred_sfc.items():
-                            if var_name in truth_sfc_eval:
-                                acc.add(display_name, var_name, current_lead, pred_arr, truth_sfc_eval[var_name])
-                                if save_diff_nc:
-                                    valid_times_map[(display_name, var_name)].append(valid_dt)
+                        # 对比图
+                        if not skip_plots:
+                            truth_sfc = extract_surface_vars(truth_blob, sfc_vars) if truth_blob else None
+                            plot_dir = Path(output_root) / "plots" / model_name.lower() / init_tag
+                            for var_name, pred_arr in pred_sfc.items():
+                                truth_arr = truth_sfc.get(var_name) if truth_sfc else None
+                                plot_compare(
+                                    plot_dir / f"{var_name}_lead{current_lead:03d}.png",
+                                    pred_arr,
+                                    truth_arr,
+                                    title=f"{display_name} +{current_lead}h {var_name} | {init_tag}",
+                                    cmap="RdBu_r" if var_name in ("u10", "v10") else "viridis",
+                                )
 
-                    if si % 8 == 0 or si == 0:
-                        _progress(f"[{display_name}] {init_tag} lead={current_lead}h done")
+                        # 内嵌评估
+                        if acc is not None and truth_blob is not None:
+                            truth_sfc_eval = extract_surface_vars(truth_blob, sfc_vars)
+                            for var_name, pred_arr in pred_sfc.items():
+                                if var_name in truth_sfc_eval:
+                                    acc.add(display_name, var_name, current_lead,
+                                            pred_arr, truth_sfc_eval[var_name])
+                                    if save_diff_nc:
+                                        valid_times_map[(display_name, var_name)].append(valid_dt)
 
-            _progress(f"[{display_name}] {init_tag} NPY 已保存: {npy_writer.get_paths()}")
+                        if si % 8 == 0 or si == 0:
+                            _progress(f"[{display_name}] {init_tag} lead={current_lead}h done")
 
-            # 保存评估结果
-            if acc is not None and enable_eval:
-                acc.save(
-                    save_dir=eval_out_dir,
-                    time_tag=init_tag,
-                    lon=lon,
-                    valid_times=valid_times_map if (save_diff_nc) else None,
-                )
-                _progress(f"[{display_name}] 评估结果已保存至: {eval_out_dir}")
+                _progress(f"[{display_name}] {init_tag} NPY 已保存: {npy_writer.get_paths()}")
 
-        _progress(f"完成 {init_tag}")
+                if acc is not None and enable_eval:
+                    acc.save(
+                        save_dir=eval_out_dir,
+                        time_tag=init_tag,
+                        lon=lon,
+                        valid_times=valid_times_map if save_diff_nc else None,
+                    )
+                    _progress(f"[{display_name}] 评估结果已保存至: {eval_out_dir}")
 
-    _progress("全部日期处理完成")
+                _progress(f"[{display_name}] 完成 {init_tag}")
+
+        finally:
+            # 无论推理是否成功都卸载，确保 VRAM 释放给下一个模型
+            _progress(f"[{display_name}] 卸载模型，释放 VRAM...")
+            model.unload()
+
+    _progress("全部模型/日期处理完成")

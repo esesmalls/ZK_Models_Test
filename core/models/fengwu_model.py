@@ -150,6 +150,13 @@ class FengWuModel(WeatherModel):
             lead=state.lead + self._step_h,
         )
 
+    def unload(self) -> None:
+        """释放 ONNX Session，归还 GPU 显存。"""
+        import gc
+        self._sess = None
+        self._loaded = False
+        gc.collect()
+
     def get_surface_var_names(self) -> List[str]:
         return ["u10", "v10", "t2m", "msl"]
 
