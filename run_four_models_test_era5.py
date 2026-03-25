@@ -82,7 +82,6 @@ from infer_cepri_onnx import (
     fengwu_normalize_for_onnx,
     fuxi_normalize_for_layout,
     fuxi_prepare_onnx_input,
-    fuxi_temb,
     pangu_one_step,
     pick_providers,
     unpack_fengwu_ort_outputs,
@@ -98,6 +97,22 @@ def _plot_map(path: Path, arr: np.ndarray, title: str, cmap: str = "viridis") ->
     fig.tight_layout()
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
+
+
+def _fuxi_temb_like_zforecast(start_time_utc: datetime, step_idx_1based: int, freq_hours: int) -> np.ndarray:
+    """
+    Match zforecast.py style:
+      times = init_time + [i-1, i, i+1] * freq_hours
+      features = [(day_of_year/366, hour/24)] * 3
+      temb = concat(sin(features), cos(features)) -> shape (1, 12)
+    """
+    i = int(step_idx_1based)
+    times = [start_time_utc + timedelta(hours=freq_hours * k) for k in (i - 1, i, i + 1)]
+    feats: list[float] = []
+    for t in times:
+        feats.extend([float(t.timetuple().tm_yday) / 366.0, float(t.hour) / 24.0])
+    x = np.asarray(feats, dtype=np.float32)
+    return np.concatenate([np.sin(x), np.cos(x)], axis=0)[np.newaxis, :]
 
 
 def _field_diag(tag: str, name: str, arr: np.ndarray) -> None:
@@ -532,10 +547,21 @@ def run_pangu_rollout(
         _progress("Pangu", f"步 {step}/{num_steps} 完成")
 
         cur_p, cur_s = op, os_
-        c1p, c1s = cur_p.copy(), cur_s.copy()
-        c3p, c3s = cur_p.copy(), cur_s.copy()
-        c6p, c6s = cur_p.copy(), cur_s.copy()
-        c24p, c24s = cur_p.copy(), cur_s.copy()
+        # Keep step-specific streams aligned with the model actually used at this step.
+        if use_24h:
+            c1p, c1s = cur_p.copy(), cur_s.copy()
+            c3p, c3s = cur_p.copy(), cur_s.copy()
+            c6p, c6s = cur_p.copy(), cur_s.copy()
+            c24p, c24s = cur_p.copy(), cur_s.copy()
+        elif use_6h:
+            c1p, c1s = cur_p.copy(), cur_s.copy()
+            c3p, c3s = cur_p.copy(), cur_s.copy()
+            c6p, c6s = cur_p.copy(), cur_s.copy()
+        elif use_3h:
+            c1p, c1s = cur_p.copy(), cur_s.copy()
+            c3p, c3s = cur_p.copy(), cur_s.copy()
+        else:
+            c1p, c1s = cur_p.copy(), cur_s.copy()
     print(f"[pangu] 已写 {num_steps} 步图 -> {out_plot}")
 
 
@@ -583,10 +609,14 @@ def run_fengwu_once(
         last_denorm = pred69.astype(np.float32)
         np.save(out_plot / f"fengwu_step{step:02d}_pred69.npy", pred69)
         if cur.shape[1] == 138 and stats_dir is not None:
-            pred69_norm = fengwu_normalize_for_onnx(pred69[np.newaxis, ...], stats_dir)[0]
-            cur = np.concatenate([cur[:, 69:], pred69_norm[np.newaxis, ...]], axis=1).astype(
-                np.float32
-            )
+            try:
+                pred69_norm = fengwu_normalize_for_onnx(pred69[np.newaxis, ...], stats_dir)[0]
+                cur = np.concatenate([cur[:, 69:], pred69_norm[np.newaxis, ...]], axis=1).astype(np.float32)
+            except Exception as e:
+                # If stats/channel mismatch happens here, we cannot continue autoregressive rollout safely.
+                # Still keep the last_denorm outputs (step1 plots) and stop the loop.
+                print(f"[fengwu] warning: failed to normalize for autoregressive update: {e}", flush=True)
+                break
         else:
             break
 
@@ -658,7 +688,7 @@ def run_fuxi_once(
     date_yyyymmdd: str,
     hour0: int,
     providers,
-    stats_dir: Path,
+    stats_dir: Path | None,
     out_plot: Path,
     do_compare: bool,
     compare_lead_hours: int,
@@ -678,19 +708,26 @@ def run_fuxi_once(
     print(f"[fuxi] input layout={fuxi_layout}, x.shape={x.shape}", flush=True)
     mu: np.ndarray | None = None
     sd: np.ndarray | None = None
-    if (stats_dir / "global_means.npy").is_file():
+    if stats_dir is not None and (stats_dir / "global_means.npy").is_file():
         mu = np.load(stats_dir / "global_means.npy")[:, :70, :, :]
         sd = np.load(stats_dir / "global_stds.npy")[:, :70, :, :]
         x = fuxi_normalize_for_layout(x, Path(stats_dir), fuxi_layout)
     x = x.astype(np.float32)
-    _progress("Fuxi", f"sess.run（简易temb + (h,h+1) 双帧，num_steps={num_steps}）…")
+    _progress("Fuxi", f"sess.run（zforecast风格temb + (h,h+1) 双帧，num_steps={num_steps}）…")
+    start_time_utc = datetime(
+        int(date_yyyymmdd[:4]),
+        int(date_yyyymmdd[4:6]),
+        int(date_yyyymmdd[6:8]),
+        int(hour0),
+        tzinfo=pytz.utc,
+    )
     cur = x
     out = None
     for step in range(1, int(num_steps) + 1):
         feeds = {}
         for inp in sess.get_inputs():
             if "temb" in inp.name.lower():
-                feeds[inp.name] = fuxi_temb(6 * step)
+                feeds[inp.name] = _fuxi_temb_like_zforecast(start_time_utc, step, int(compare_lead_hours))
             else:
                 feeds[inp.name] = cur
         y = sess.run(None, feeds)[0]
@@ -749,16 +786,11 @@ def run_fuxi_once(
         "h1000_r": ("1000 hPa RH (FuXi channel)", "viridis", "h1000_rh"),
     }
 
-    base_t = datetime(
-        int(date_yyyymmdd[:4]),
-        int(date_yyyymmdd[4:6]),
-        int(date_yyyymmdd[6:8]),
-        h_curr,
-        tzinfo=pytz.utc,
-    )
+    base_t = start_time_utc
     # Compare with valid time of the plotted step.
     step_for_plot = int(num_steps) if int(plot_step) < 0 else int(plot_step)
-    valid_t = base_t + timedelta(hours=6 * step_for_plot)
+    lead_for_plot = int(compare_lead_hours) * step_for_plot
+    valid_t = base_t + timedelta(hours=lead_for_plot)
     print(f"[fuxi] compare valid_time={valid_t.strftime('%Y-%m-%d %H:%M:%SZ')}", flush=True)
     tb = load_era5_truth_blob(era5_root, valid_t) if do_compare else None
 
@@ -772,7 +804,7 @@ def run_fuxi_once(
         _plot_map(
             out_plot / f"fuxi_step01_{fid}.png",
             arr,
-            f"Fuxi short +{compare_lead_hours}h: {lab}{stats_note}",
+            f"Fuxi short +{lead_for_plot}h: {lab}{stats_note}",
             cmap=cmap,
         )
         if do_compare and tid is not None:
@@ -780,7 +812,7 @@ def run_fuxi_once(
                 out_plot / f"fuxi_step01_{fid}_compare.png",
                 arr,
                 tb,
-                f"Fuxi short +{compare_lead_hours}h vs ERA5 {valid_t.strftime('%Y-%m-%d %H')}Z | {lab}",
+                f"Fuxi short +{lead_for_plot}h vs ERA5 {valid_t.strftime('%Y-%m-%d %H')}Z | {lab}",
                 field_id=tid,
             )
     print(f"[fuxi] 已写单步图 -> {out_plot}")
@@ -885,7 +917,16 @@ def main() -> None:
     else:
         _progress("数据", "跳过输入场 PNG（未跑 GraphCast/Pangu）")
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    if args.device == "cpu":
+        device = torch.device("cpu")
+    elif args.device in ("cuda", "dcu"):
+        if torch.cuda.is_available():
+            device = torch.device("cuda:0")
+        else:
+            print(f"[device] {args.device} requested but CUDA/ROCm unavailable; fallback to CPU", flush=True)
+            device = torch.device("cpu")
+    else:
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     if run_graphcast and blob0 is not None and mu is not None and sd is not None:
         try:
             start_time = datetime(
@@ -923,7 +964,20 @@ def main() -> None:
 
     if run_fengwu:
         try:
-            fw_stats = args.stats_for_fengwu or Path(cfg.stats_dir)
+            if args.stats_for_fengwu is not None:
+                fw_stats = args.stats_for_fengwu
+            else:
+                fw_default = ZK_ROOT / "fengwu"
+                has_fw_stats = (
+                    (fw_default / "data_mean.npy").is_file()
+                    and (fw_default / "data_std.npy").is_file()
+                ) or (
+                    (fw_default / "global_means.npy").is_file()
+                    and (fw_default / "global_stds.npy").is_file()
+                )
+                fw_stats = fw_default if has_fw_stats else None
+                if fw_stats is None:
+                    print("[fengwu] 未找到官方 stats（data_mean/data_std），将跳过归一化直接推理", flush=True)
             run_fengwu_once(
                 era5_root,
                 date,
@@ -941,11 +995,21 @@ def main() -> None:
     else:
         print("[fengwu] 跳过（--only-models）", flush=True)
 
-    stats_fuxi = args.stats_for_fuxi or Path(cfg.stats_dir)
-    if run_fuxi and not (stats_fuxi / "global_means.npy").is_file():
-        raise FileNotFoundError(f"FuXi stats missing global_means.npy: {stats_fuxi}")
-    if run_fuxi and not (stats_fuxi / "global_stds.npy").is_file():
-        raise FileNotFoundError(f"FuXi stats missing global_stds.npy: {stats_fuxi}")
+    # FuXi: allow running without stats (aligned with zforecast.py workflow).
+    stats_fuxi = args.stats_for_fuxi
+    if run_fuxi:
+        if stats_fuxi is None:
+            print("[fuxi] 未提供 --stats-for-fuxi：按 raw 输入/输出推理", flush=True)
+        else:
+            has_mu = (stats_fuxi / "global_means.npy").is_file()
+            has_sd = (stats_fuxi / "global_stds.npy").is_file()
+            if not (has_mu and has_sd):
+                print(
+                    f"[fuxi] stats 不完整（{stats_fuxi}），将按 raw 输入/输出推理："
+                    f"global_means={has_mu}, global_stds={has_sd}",
+                    flush=True,
+                )
+                stats_fuxi = None
     if run_fuxi:
         try:
             run_fuxi_once(
