@@ -1,0 +1,49 @@
+# ============================================================
+# 流水线全局默认值
+# CLI 参数优先于此文件；此文件优先于代码硬编码值
+# ============================================================
+
+pipeline:
+
+  # -------- 滚动推理默认配置 --------
+  rolling:
+    init_hour: 12                        # 起报时刻（UTC）
+    lead_step_hours: 6                   # 每步步长
+    max_lead_hours: 240                  # 最大预报时长
+    # 默认输出变量：全部地表变量（空列表=自动取所选模型的 surface_channels）
+    variables: []
+    output_root: "/public/share/aciwgvx1jd/GunDong_Infer_result_12h"
+    skip_plots: false
+    save_nc: false                       # 是否逐步写 NC 文件（较慢，Pangu/GraphCast 默认需要）
+    # ---- 内嵌评估 ----
+    enable_eval: false
+    save_diff: false                     # 是否保存 diff npy/nc（默认关闭，节省磁盘）
+
+  # -------- 初步推理验证默认配置 --------
+  verify:
+    num_steps: 2                         # 推理步数
+    # 默认出图变量：全地表 + 1000hPa 各要素
+    default_surface_vars: ["u10", "v10", "t2m", "msl"]
+    default_pressure_vars:
+      z:   [1000]
+      t:   [1000]
+      u:   [1000]
+      v:   [1000]
+    output_root: "results/verify"
+
+# -------- 硬件监控 --------
+monitoring:
+  enabled: true
+  poll_interval_seconds: 30             # 轮询间隔
+  log_dir: "logs"                       # 相对于工作目录
+  # 工具优先级：auto 先找 rocm-smi，再找 nvidia-smi，最后 cpu-only
+  backend: auto                         # auto | rocm-smi | nvidia-smi | cpu-only
+
+# -------- 定量评估独立运行默认值 --------
+evaluation:
+  era5_dir: "/public/share/aciwgvx1jd/20260324/surface"
+  pred_base_dir: "/public/share/aciwgvx1jd/GunDong_Infer_result_12h"
+  step_interval_hours: 6
+  expected_steps: 40                    # 240h / 6h = 40
+  metrics: ["W-MAE", "W-RMSE"]         # 后续可加 ACC、BIAS 等
+  save_diff: false
