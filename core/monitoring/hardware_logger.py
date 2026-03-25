@@ -53,37 +53,97 @@ def _detect_backend() -> str:
 
 
 def _query_rocm_smi() -> List[Dict]:
-    """解析 rocm-smi 输出，返回每卡信息列表。"""
+    """解析 rocm-smi 输出，返回每卡信息列表。
+
+    rocm-smi CSV 列名因版本而异，常见形式：
+      time, device, DCU use (%), vram Total Memory (B), vram Total Used Memory (B)
+    或旧版：
+      device, GPU%, VRAM Total Memory (B), VRAM In Use (B)
+    统一映射到内部字段：gpu_id, gpu_util, vram_used_mb, vram_total_mb。
+    """
+    # CSV 列名到内部字段的模糊映射规则（顺序：先匹配者优先）
+    _COL_RULES = [
+        # (内部字段,  匹配关键字列表,  转换函数)
+        ("gpu_id",       ["device", "card"],                            lambda v: v),
+        ("gpu_util",     ["dcu use", "gpu use", "gpu%", "use (%)"],     lambda v: float(v or 0)),
+        ("vram_used_mb", ["used memory", "in use", "used"],             lambda v: float(v or 0) / 1024**2),
+        ("vram_total_mb",["total memory", "vram total", "total mem"],   lambda v: float(v or 0) / 1024**2),
+    ]
+
+    def _map_header(raw_headers: List[str]) -> Dict[int, str]:
+        """将 CSV 原始列名映射到内部字段，返回 {列索引: 内部字段名}。"""
+        mapping: Dict[int, str] = {}
+        matched_fields: set = set()
+        for col_i, raw in enumerate(raw_headers):
+            rl = raw.lower()
+            for field, keywords, _ in _COL_RULES:
+                if field in matched_fields:
+                    continue
+                if any(kw in rl for kw in keywords):
+                    mapping[col_i] = field
+                    matched_fields.add(field)
+                    break
+        return mapping
+
     try:
         result = subprocess.run(
             ["rocm-smi", "--showuse", "--showmeminfo", "vram", "--csv"],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode != 0:
-            return []
+            return _parse_rocm_text_fallback()
+
         lines = [l.strip() for l in result.stdout.splitlines() if l.strip()]
-        # 寻找 "GPU%" 和 "VRAM Used" 列
-        gpu_records = []
-        header = None
-        for line in lines:
-            if line.startswith("device") or "GPU" in line.upper():
+        if not lines:
+            return _parse_rocm_text_fallback()
+
+        # 找到 CSV 标题行（含逗号，且含时间或 device 字样）
+        header_idx = -1
+        header_parts: List[str] = []
+        for i, line in enumerate(lines):
+            if "," in line:
                 parts = [p.strip() for p in line.split(",")]
-                if header is None and any("%" in p or "use" in p.lower() for p in parts):
-                    header = parts
-                    continue
-            if header:
-                parts = [p.strip() for p in line.split(",")]
-                if len(parts) >= len(header) - 1:
-                    rec = dict(zip(header, parts))
-                    gpu_records.append(rec)
-        # 若 CSV 解析失败，退回 --showuse 文本模式
-        if not gpu_records:
-            result2 = subprocess.run(
-                ["rocm-smi", "--showuse", "--showmeminfo", "vram"],
-                capture_output=True, text=True, timeout=10
-            )
-            return _parse_rocm_text(result2.stdout)
-        return gpu_records
+                low = line.lower()
+                if "device" in low or "card" in low or "dcu" in low or "gpu" in low:
+                    header_idx = i
+                    header_parts = parts
+                    break
+
+        if header_idx < 0:
+            return _parse_rocm_text_fallback()
+
+        col_map = _map_header(header_parts)
+        field_conv = {field: fn for field, _kws, fn in _COL_RULES}
+
+        gpu_records: List[Dict] = []
+        for line in lines[header_idx + 1:]:
+            if not line or not "," in line:
+                continue
+            parts = [p.strip() for p in line.split(",")]
+            rec: Dict = {}
+            for col_i, field in col_map.items():
+                if col_i < len(parts):
+                    try:
+                        rec[field] = field_conv[field](parts[col_i])
+                    except (ValueError, ZeroDivisionError):
+                        rec[field] = 0.0
+            if rec:
+                gpu_records.append(rec)
+
+        return gpu_records if gpu_records else _parse_rocm_text_fallback()
+
+    except Exception:
+        return _parse_rocm_text_fallback()
+
+
+def _parse_rocm_text_fallback() -> List[Dict]:
+    """fallback：用非 CSV 文本模式查询 rocm-smi。"""
+    try:
+        result = subprocess.run(
+            ["rocm-smi", "--showuse", "--showmeminfo", "vram"],
+            capture_output=True, text=True, timeout=10
+        )
+        return _parse_rocm_text(result.stdout)
     except Exception:
         return []
 
@@ -91,7 +151,7 @@ def _query_rocm_smi() -> List[Dict]:
 def _parse_rocm_text(text: str) -> List[Dict]:
     """解析 rocm-smi 非 CSV 文本输出。"""
     records = []
-    current = {}
+    current: Dict = {}
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("GPU["):
@@ -99,19 +159,18 @@ def _parse_rocm_text(text: str) -> List[Dict]:
                 records.append(current)
             gpu_id = line.split("[")[1].split("]")[0]
             current = {"gpu_id": gpu_id}
-        elif "GPU use (%)" in line or "GPU%" in line:
+        elif any(k in line for k in ("GPU use (%)", "GPU%", "DCU use")):
             try:
                 current["gpu_util"] = float(line.split(":")[-1].strip().replace("%", ""))
             except ValueError:
                 pass
-        elif "VRAM Total Memory" in line or "vram_total" in line.lower():
+        elif "Total Memory" in line:
             try:
-                current["vram_total_mb"] = float(line.split(":")[-1].strip().split()[0])
-            except ValueError:
-                pass
-        elif "VRAM In Use" in line or "vram_used" in line.lower():
-            try:
-                current["vram_used_mb"] = float(line.split(":")[-1].strip().split()[0])
+                val_b = float(line.split(":")[-1].strip().split()[0])
+                if "Used" in line or "In Use" in line:
+                    current["vram_used_mb"] = val_b / 1024**2
+                else:
+                    current["vram_total_mb"] = val_b / 1024**2
             except ValueError:
                 pass
     if current:
