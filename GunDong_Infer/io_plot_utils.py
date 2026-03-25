@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import matplotlib
 
@@ -18,21 +18,31 @@ def write_step_nc(
     init_time: str,
     lead_hours: int,
     valid_time: str,
-    h1000_t: np.ndarray,
-    v10: np.ndarray,
+    vars_2d: Dict[str, np.ndarray],
+    vars_3d: Optional[Dict[str, np.ndarray]] = None,
+    level_values: Optional[np.ndarray] = None,
     lat: np.ndarray,
     lon: np.ndarray,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    coords = {
+        "latitude": np.asarray(lat, dtype=np.float32),
+        "longitude": np.asarray(lon, dtype=np.float32),
+    }
+    data_vars: Dict[str, tuple] = {}
+    for k, v in vars_2d.items():
+        data_vars[k] = (("latitude", "longitude"), np.asarray(v, dtype=np.float32))
+
+    if vars_3d:
+        if level_values is None:
+            raise ValueError("level_values is required when vars_3d is provided")
+        coords["level"] = np.asarray(level_values, dtype=np.float32)
+        for k, v in vars_3d.items():
+            data_vars[k] = (("level", "latitude", "longitude"), np.asarray(v, dtype=np.float32))
+
     ds = xr.Dataset(
-        data_vars={
-            "h1000_t": (("latitude", "longitude"), np.asarray(h1000_t, dtype=np.float32)),
-            "v10": (("latitude", "longitude"), np.asarray(v10, dtype=np.float32)),
-        },
-        coords={
-            "latitude": np.asarray(lat, dtype=np.float32),
-            "longitude": np.asarray(lon, dtype=np.float32),
-        },
+        data_vars=data_vars,
+        coords=coords,
         attrs={
             "model": model,
             "init_time_utc": init_time,
@@ -40,10 +50,6 @@ def write_step_nc(
             "valid_time_utc": valid_time,
         },
     )
-    ds["h1000_t"].attrs["long_name"] = "temperature_at_1000hPa"
-    ds["h1000_t"].attrs["units"] = "K"
-    ds["v10"].attrs["long_name"] = "10m_v_component_of_wind"
-    ds["v10"].attrs["units"] = "m s-1"
     ds.to_netcdf(path)
 
 

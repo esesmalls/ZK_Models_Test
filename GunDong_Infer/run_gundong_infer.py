@@ -171,6 +171,7 @@ def _run_one_date_pangu(
     data_root: Path,
     out_dir: Path,
     providers,
+    skip_plots: bool,
 ) -> None:
     paths = {
         "6h": ZK_ROOT / "pangu" / "pangu_weather_6.onnx",
@@ -200,31 +201,46 @@ def _run_one_date_pangu(
         t_true, v_true = _extract_truth_fields(tb)
 
         nc_path = out_dir / "nc" / "pangu" / f"lead_{lead:03d}.nc"
+        vars_2d = {
+            "surface_msl": s_cur[0, 0],
+            "surface_u10": s_cur[0, 1],
+            "surface_v10": s_cur[0, 2],
+            "surface_t2m": s_cur[0, 3],
+        }
+        vars_3d = {
+            "pressure_z": p_cur[0, 0],
+            "pressure_q": p_cur[0, 1],
+            "pressure_t": p_cur[0, 2],
+            "pressure_u": p_cur[0, 3],
+            "pressure_v": p_cur[0, 4],
+        }
         write_step_nc(
             nc_path,
             model="pangu",
             init_time=init_s,
             lead_hours=lead,
             valid_time=valid_s,
-            h1000_t=h1000_t,
-            v10=v10,
+            vars_2d=vars_2d,
+            vars_3d=vars_3d,
+            level_values=np.asarray(PANGU_LEVELS, dtype=np.float32),
             lat=lat,
             lon=lon,
         )
-        plot_compare(
-            out_dir / "plots" / "pangu" / f"h1000_t_compare_lead{lead:03d}.png",
-            h1000_t,
-            t_true,
-            title=f"Pangu +{lead}h h1000_t",
-            cmap="viridis",
-        )
-        plot_compare(
-            out_dir / "plots" / "pangu" / f"v10_compare_lead{lead:03d}.png",
-            v10,
-            v_true,
-            title=f"Pangu +{lead}h v10",
-            cmap="RdBu_r",
-        )
+        if not skip_plots:
+            plot_compare(
+                out_dir / "plots" / "pangu" / f"h1000_t_compare_lead{lead:03d}.png",
+                h1000_t,
+                t_true,
+                title=f"Pangu +{lead}h h1000_t",
+                cmap="viridis",
+            )
+            plot_compare(
+                out_dir / "plots" / "pangu" / f"v10_compare_lead{lead:03d}.png",
+                v10,
+                v_true,
+                title=f"Pangu +{lead}h v10",
+                cmap="RdBu_r",
+            )
 
 
 def _run_one_date_graphcast(
@@ -238,6 +254,7 @@ def _run_one_date_graphcast(
     mu: np.ndarray,
     sd: np.ndarray,
     device: torch.device,
+    skip_plots: bool,
 ) -> None:
     blob0 = load_time_blob(data_root, date, hour0)
     init_dt = datetime(int(date[:4]), int(date[4:6]), int(date[6:8]), hour0, tzinfo=pytz.UTC)
@@ -275,6 +292,10 @@ def _run_one_date_graphcast(
             arr = pred.float().cpu().numpy()[0]
             h1000_t = arr[idx_t1000] * sd[idx_t1000] + mu[idx_t1000]
             v10 = arr[idx_v10] * sd[idx_v10] + mu[idx_v10]
+            vars_2d = {}
+            for i, ch in enumerate(cfg.channels):
+                k = ch.lower().replace("-", "_").replace(" ", "_")
+                vars_2d[f"gc_{k}"] = arr[i] * sd[i] + mu[i]
             valid_dt = init_dt + timedelta(hours=int(lead))
             valid_s = valid_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             tb = load_truth_blob_for_valid_time(data_root, valid_dt)
@@ -287,25 +308,25 @@ def _run_one_date_graphcast(
                 init_time=init_s,
                 lead_hours=lead,
                 valid_time=valid_s,
-                h1000_t=h1000_t,
-                v10=v10,
+                vars_2d=vars_2d,
                 lat=lat,
                 lon=lon,
             )
-            plot_compare(
-                out_dir / "plots" / "graphcast" / f"h1000_t_compare_lead{lead:03d}.png",
-                h1000_t,
-                t_true,
-                title=f"GraphCast +{lead}h h1000_t",
-                cmap="viridis",
-            )
-            plot_compare(
-                out_dir / "plots" / "graphcast" / f"v10_compare_lead{lead:03d}.png",
-                v10,
-                v_true,
-                title=f"GraphCast +{lead}h v10",
-                cmap="RdBu_r",
-            )
+            if not skip_plots:
+                plot_compare(
+                    out_dir / "plots" / "graphcast" / f"h1000_t_compare_lead{lead:03d}.png",
+                    h1000_t,
+                    t_true,
+                    title=f"GraphCast +{lead}h h1000_t",
+                    cmap="viridis",
+                )
+                plot_compare(
+                    out_dir / "plots" / "graphcast" / f"v10_compare_lead{lead:03d}.png",
+                    v10,
+                    v_true,
+                    title=f"GraphCast +{lead}h v10",
+                    cmap="RdBu_r",
+                )
 
 
 def main() -> None:
@@ -318,6 +339,7 @@ def main() -> None:
     ap.add_argument("--device", default="auto", choices=["auto", "dcu", "cuda", "cpu"])
     ap.add_argument("--only-models", default="", help="comma list: pangu,graphcast")
     ap.add_argument("--date-filter", default="", help="comma list dates yyyymmdd")
+    ap.add_argument("--skip-plots", action="store_true", help="only write nc, do not generate plots")
     args = ap.parse_args()
 
     _set_local_visible_device()
@@ -361,6 +383,7 @@ def main() -> None:
                 data_root=args.input_root,
                 out_dir=out_dir,
                 providers=providers,
+                skip_plots=args.skip_plots,
             )
             _progress(f"{init_tag} pangu done")
         if run_graphcast:
@@ -374,6 +397,7 @@ def main() -> None:
                 mu=mu,
                 sd=sd,
                 device=device,
+                skip_plots=args.skip_plots,
             )
             _progress(f"{init_tag} graphcast done")
         _progress(f"finished {init_tag}")

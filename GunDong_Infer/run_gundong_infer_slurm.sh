@@ -24,6 +24,7 @@ START_HOUR="${START_HOUR:-0}"
 DEVICE="${DEVICE:-auto}"
 ONLY_MODELS="${ONLY_MODELS:-pangu,graphcast}"
 DATE_FILTER="${DATE_FILTER:-}"
+SKIP_PLOTS="${SKIP_PLOTS:-0}"
 
 echo "[info] job=${SLURM_JOB_ID:-na}"
 echo "[info] input=${INPUT_ROOT}"
@@ -54,6 +55,10 @@ python -c "import onnxruntime as ort; print('ORT providers:', ort.get_available_
 cd "${WORKDIR}"
 
 NPROC=${NPROC_PER_NODE:-8}
+EXTRA_ARGS=()
+if [ "${SKIP_PLOTS}" = "1" ]; then
+  EXTRA_ARGS+=(--skip-plots)
+fi
 srun --nodes=1 --ntasks=1 torchrun \
   --standalone \
   --nproc_per_node="${NPROC}" \
@@ -65,5 +70,6 @@ srun --nodes=1 --ntasks=1 torchrun \
   --lead-step-hours "${LEAD_STEP}" \
   --device "${DEVICE}" \
   --only-models "${ONLY_MODELS}" \
-  --date-filter "${DATE_FILTER}"
+  --date-filter "${DATE_FILTER}" \
+  "${EXTRA_ARGS[@]}"
 
