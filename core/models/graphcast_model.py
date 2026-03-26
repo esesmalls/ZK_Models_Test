@@ -122,6 +122,19 @@ class GraphCastModel(WeatherModel):
             np.stack(latlon, axis=0), dtype=_torch.float32
         )
         self._loaded = True
+        print(
+            f"[GraphCast] device={self._device} torch.cuda.is_available()={torch.cuda.is_available()}",
+            flush=True,
+        )
+        if torch.cuda.is_available():
+            try:
+                idx = torch.cuda.current_device()
+                print(
+                    f"[GraphCast] cuda.current_device={idx} name={torch.cuda.get_device_name(idx)}",
+                    flush=True,
+                )
+            except Exception as ex:
+                print(f"[GraphCast] cuda device info: {ex}", flush=True)
 
     def init_state(
         self,

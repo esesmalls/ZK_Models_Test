@@ -21,7 +21,12 @@ _ZK_ROOT = Path(__file__).resolve().parents[2]
 if str(_ZK_ROOT) not in sys.path:
     sys.path.insert(0, str(_ZK_ROOT))
 
-from infer_cepri_onnx import create_session, pangu_one_step, pick_providers  # noqa: E402
+from infer_cepri_onnx import (  # noqa: E402
+    create_session,
+    log_ort_session,
+    pangu_one_step,
+    pick_providers,
+)
 
 
 class PanguModel(WeatherModel):
@@ -41,6 +46,8 @@ class PanguModel(WeatherModel):
                 self._sessions[key] = create_session(p, providers)
         if "6h" not in self._sessions:
             raise FileNotFoundError("Pangu: 找不到 pangu_weather_6.onnx，请检查 config/models.yaml 路径")
+        for key, sess in self._sessions.items():
+            log_ort_session(f"Pangu/{key}", sess)
         self._loaded = True
 
     def init_state(

@@ -45,6 +45,18 @@ def _ensure_ns_lat(data: np.ndarray, lat: np.ndarray) -> Tuple[np.ndarray, np.nd
     return data, lat
 
 
+def _msl_netcdf_to_pa(msl_var, arr: np.ndarray) -> np.ndarray:
+    """若 NetCDF 标注为 hPa/mbar，转为 Pa（与 ECMWF 常用分析场一致）。"""
+    try:
+        u = str(getattr(msl_var, "units", "") or "").strip().lower()
+    except Exception:
+        u = ""
+    a = np.asarray(arr, dtype=np.float32)
+    if u in ("hpa", "hectopascal", "hectopascals", "millibar", "millibars", "mbar"):
+        return (a * 100.0).astype(np.float32)
+    return a
+
+
 def _find_hour_index(ts_sec: np.ndarray, hour: int) -> int:
     for i, v in enumerate(np.asarray(ts_sec).tolist()):
         if datetime.utcfromtimestamp(int(v)).hour == int(hour):
@@ -113,7 +125,7 @@ class GunDongAdapter(DataAdapter):
             t_s = r_p("t")
             u_s = r_p("u")
             v_s = r_p("v")
-            msl = r_s("msl")
+            msl = _msl_netcdf_to_pa(ds.variables["msl"], r_s("msl"))
             u10 = r_s("u10")
             v10 = r_s("v10")
             t2m = r_s("t2m")

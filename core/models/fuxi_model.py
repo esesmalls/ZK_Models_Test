@@ -23,6 +23,7 @@ from infer_cepri_onnx import (  # noqa: E402
     create_session,
     fuxi_prepare_onnx_input,
     fuxi_temb,
+    log_ort_session,
     pick_providers,
 )
 
@@ -49,6 +50,7 @@ class FuXiModel(WeatherModel):
 
         providers = pick_providers(str(device) if not isinstance(device, str) else device)
         self._sess = create_session(onnx_path, providers)
+        log_ort_session("FuXi", self._sess)
         self._loaded = True
 
     def init_state(

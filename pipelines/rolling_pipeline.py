@@ -32,12 +32,16 @@ if str(_ZK_ROOT) not in sys.path:
 os.chdir(_GRAPH_ROOT)
 
 from core.data.detector import get_adapter
-from core.data.channel_mapper import extract_surface_vars, SURFACE_VAR_KEYS
+from core.data.channel_mapper import extract_surface_vars
+from core.data.surface_units import harmonize_surface_pair
 from core.models import build_registry
 from core.evaluation.metrics import MetricsAccumulator
 from zk_io.npy_writer import NpyStackWriter
 from zk_io.nc_writer import write_step_nc
 from zk_io.plot_utils import plot_compare
+
+# 与 evaluate_models.py 中 MODELS 顺序一致，用于多模型时序图配色/图例
+_EVAL_MODEL_ORDER = ["PanGu", "FengWu", "FuXi", "GraphCast"]
 
 
 def _progress(msg: str) -> None:
@@ -197,6 +201,11 @@ def run_rolling(
 
     _progress(f"处理日期: {dates}  模型: {model_names}")
 
+    # 按 init_tag 共享 MetricsAccumulator：所有模型跑完后一次性写 CSV/时序图，避免相互覆盖
+    acc_by_tag: Dict[str, MetricsAccumulator] = {}
+    valid_times_by_tag: Dict[str, Dict[Tuple[str, str], List]] = {}
+    lon_by_tag: Dict[str, np.ndarray] = {}
+
     # ---------------------------------------------------------------
     # 外层循环：模型；内层循环：日期
     # 每个模型独占一次 VRAM：加载 → 跑完所有日期 → 卸载 → 下一个模型
@@ -236,7 +245,7 @@ def run_rolling(
 
                 lat = init_blob.get("lat", np.linspace(90.0, -90.0, 721, dtype=np.float32))
                 lon = init_blob.get("lon", np.arange(0.0, 360.0, 0.25, dtype=np.float32))
-                eval_out_dir = Path(output_root) / f"eval_{max_lead}h_{init_tag}"
+                lon_by_tag[init_tag] = lon
 
                 _progress(f"[{display_name}] 开始滚动推理 {init_tag}，步长={step_h}h，共 {n_steps} 步")
 
@@ -247,18 +256,16 @@ def run_rolling(
                     _progress(f"[{display_name}] init_state 失败: {e}")
                     continue
 
-                # 初始化 MetricsAccumulator（每个 init_tag 独立）
-                acc = None
-                valid_times_map: Dict[Tuple[str, str], List] = {}
                 if enable_eval:
-                    acc = MetricsAccumulator(
-                        lats=lat,
-                        metrics=metrics,
-                        save_diff=save_diff,
-                        save_diff_nc=save_diff_nc,
-                    )
-                    for var in sfc_vars:
-                        valid_times_map[(display_name, var)] = []
+                    if init_tag not in acc_by_tag:
+                        acc_by_tag[init_tag] = MetricsAccumulator(
+                            lats=lat,
+                            metrics=metrics,
+                            save_diff=save_diff,
+                            save_diff_nc=save_diff_nc,
+                        )
+                        valid_times_by_tag[init_tag] = {}
+                acc = acc_by_tag.get(init_tag) if enable_eval else None
 
                 # NPY 写出器
                 with NpyStackWriter(
@@ -316,6 +323,10 @@ def run_rolling(
                             plot_dir = Path(output_root) / "plots" / model_name.lower() / init_tag
                             for var_name, pred_arr in pred_sfc.items():
                                 truth_arr = truth_sfc.get(var_name) if truth_sfc else None
+                                if truth_arr is not None:
+                                    pred_arr, truth_arr = harmonize_surface_pair(
+                                        var_name, pred_arr, truth_arr
+                                    )
                                 plot_compare(
                                     plot_dir / f"{var_name}_lead{current_lead:03d}.png",
                                     pred_arr,
@@ -329,24 +340,21 @@ def run_rolling(
                             truth_sfc_eval = extract_surface_vars(truth_blob, sfc_vars)
                             for var_name, pred_arr in pred_sfc.items():
                                 if var_name in truth_sfc_eval:
-                                    acc.add(display_name, var_name, current_lead,
-                                            pred_arr, truth_sfc_eval[var_name])
+                                    p_h, t_h = harmonize_surface_pair(
+                                        var_name, pred_arr, truth_sfc_eval[var_name]
+                                    )
+                                    acc.add(
+                                        display_name, var_name, current_lead, p_h, t_h
+                                    )
                                     if save_diff_nc:
-                                        valid_times_map[(display_name, var_name)].append(valid_dt)
+                                        valid_times_by_tag[init_tag].setdefault(
+                                            (display_name, var_name), []
+                                        ).append(valid_dt)
 
                         if si % 8 == 0 or si == 0:
                             _progress(f"[{display_name}] {init_tag} lead={current_lead}h done")
 
                 _progress(f"[{display_name}] {init_tag} NPY 已保存: {npy_writer.get_paths()}")
-
-                if acc is not None and enable_eval:
-                    acc.save(
-                        save_dir=eval_out_dir,
-                        time_tag=init_tag,
-                        lon=lon,
-                        valid_times=valid_times_map if save_diff_nc else None,
-                    )
-                    _progress(f"[{display_name}] 评估结果已保存至: {eval_out_dir}")
 
                 _progress(f"[{display_name}] 完成 {init_tag}")
 
@@ -354,5 +362,17 @@ def run_rolling(
             # 无论推理是否成功都卸载，确保 VRAM 释放给下一个模型
             _progress(f"[{display_name}] 卸载模型，释放 VRAM...")
             model.unload()
+
+    if enable_eval and acc_by_tag:
+        for init_tag, acc in acc_by_tag.items():
+            eval_out_dir = Path(output_root) / f"eval_{max_lead}h_{init_tag}"
+            acc.save(
+                save_dir=eval_out_dir,
+                time_tag=init_tag,
+                lon=lon_by_tag.get(init_tag),
+                valid_times=valid_times_by_tag.get(init_tag) if save_diff_nc else None,
+                model_order=_EVAL_MODEL_ORDER,
+            )
+            _progress(f"多模型评估已写入: {eval_out_dir}")
 
     _progress("全部模型/日期处理完成")

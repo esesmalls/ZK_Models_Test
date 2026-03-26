@@ -183,6 +183,7 @@ class MetricsAccumulator:
         time_tag: str,
         lon: Optional[np.ndarray] = None,
         valid_times: Optional[Dict[Tuple[str, str], List]] = None,
+        model_order: Optional[List[str]] = None,
     ) -> None:
         """
         保存 CSV、时序图，可选 diff npy/nc。
@@ -190,6 +191,7 @@ class MetricsAccumulator:
         time_tag:    如 "20260308T12"
         lon:         经度数组（diff nc 需要）
         valid_times: {(model,var): [datetime, ...]}（diff nc 需要）
+        model_order: 时序图图例顺序（如 evaluate_models.py）；None 则按名称排序
         """
         from zk_io.plot_utils import plot_metrics_timeseries
         from zk_io.nc_writer import write_diff_nc
@@ -206,7 +208,17 @@ class MetricsAccumulator:
         df.to_csv(str(csv_path), index=False)
         print(f"[metrics] CSV 已保存: {csv_path}", flush=True)
 
-        models = sorted(df["Model"].unique())
+        df_models = set(df["Model"].unique())
+        if model_order:
+            models = []
+            seen: set = set()
+            for m in model_order:
+                if m in df_models and m not in seen:
+                    models.append(m)
+                    seen.add(m)
+            models.extend(sorted(df_models - seen))
+        else:
+            models = sorted(df_models)
         variables = sorted(df["Variable"].unique())
         max_lead = int(df["Lead_Time"].max()) if not df.empty else 240
 

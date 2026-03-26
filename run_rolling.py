@@ -28,6 +28,14 @@
       --variables u10 v10 t2m \\
       --save-nc --enable-eval --save-diff \\
       --output-root /public/share/aciwgvx1jd/my_results
+
+  # 已有 NPY 预报栈，仅重跑合并评估（CSV + 多模型时序图，可选三联图）
+  cd /path/to/graphcast
+  python ZK_Models/run_eval_npy.py \\
+      --data-source gundong_20260324 --date-range 20260310 \\
+      --init-hour 12 --max-lead 240 --lead-step 6 \\
+      --models pangu fengwu fuxi graphcast \\
+      --output-root /public/share/aciwgvx1jd/GunDong_Infer_result_12h
 """
 from __future__ import annotations
 

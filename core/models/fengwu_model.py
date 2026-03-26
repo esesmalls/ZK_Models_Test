@@ -29,6 +29,7 @@ from infer_cepri_onnx import (  # noqa: E402
     create_session,
     fengwu_denorm_chw,
     fengwu_normalize_for_onnx,
+    log_ort_session,
     pick_providers,
     unpack_fengwu_ort_outputs,
 )
@@ -53,6 +54,7 @@ class FengWuModel(WeatherModel):
 
         providers = pick_providers(str(device) if not isinstance(device, str) else device)
         self._sess = create_session(onnx_path, providers)
+        log_ort_session("FengWu", self._sess)
 
         stats_dir = cfg.get("stats_dir")
         if stats_dir:

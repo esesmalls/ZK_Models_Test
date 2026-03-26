@@ -9,6 +9,13 @@
 #   - 全部地表变量
 #   - 不开启评估（需要则设 ENABLE_EVAL=1）
 #
+# 仅基于已有 NPY 重跑合并评估（无 ONNX），在计算节点手动执行示例：
+#   cd /public/home/.../graphcast
+#   conda activate torch2.4_dtk25.04_cp310_e2s
+#   python ZK_Models/run_eval_npy.py --data-source gundong_20260324 \\
+#     --date-range 20260310 --init-hour 12 --max-lead 240 \\
+#     --models pangu fengwu fuxi graphcast --output-root /path/to/GunDong_Infer_result_12h
+#
 # 用法示例：
 #   sbatch scripts/submit_rolling.sh
 #
@@ -77,6 +84,14 @@ METRICS="${METRICS:-W-MAE W-RMSE}"
 #   model — 单日任务：1天 × 4模型 × WORLD_SIZE=4 → 每卡 1 个模型
 WORLD_SIZE="${WORLD_SIZE:-1}"
 PARALLEL_MODE="${PARALLEL_MODE:-auto}"
+
+# ---- DCU / CPU 说明（Slurm 配额）----
+# 逐模型串行 + WORLD_SIZE=1 时，同一时间只有 1 张 DCU 在跑推理，其余卡空闲属正常；
+# rocm-smi 固定间隔采样也可能在步间采到 0% 利用率。
+# 多卡并行：WORLD_SIZE>1 且 PARALLEL_MODE=model（按模型分卡）或 date（按日期分卡）时，
+# 须同时降低 #SBATCH --cpus-per-task 或提高节点 CPU 配额，使
+#   ntasks * cpus-per-task <= 节点可用核数
+# 例如 8 进程时可设：  sbatch --ntasks-per-node=8 --cpus-per-task=8 ...
 
 # ---- 打印运行信息 ----
 echo "=========================================="

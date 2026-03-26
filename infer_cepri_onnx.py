@@ -352,6 +352,15 @@ def create_session(onnx_path: Path, providers: Sequence) -> ort.InferenceSession
     )
 
 
+def log_ort_session(tag: str, sess: ort.InferenceSession) -> None:
+    """作业日志中确认实际使用的 ExecutionProvider（避免误用 CPU）。"""
+    try:
+        prov = sess.get_providers()
+        print(f"[ORT] {tag} InferenceSession providers (order): {prov}", flush=True)
+    except Exception as ex:
+        print(f"[ORT] {tag} get_providers failed: {ex}", flush=True)
+
+
 def _pangu_pressure_arr(p_in: np.ndarray) -> np.ndarray:
     """ONNX 期望 rank=4: (5, 13, H, W)，去掉任意前缀 batch 维 (1,…,1,5,13,H,W)。"""
     x = np.asarray(p_in, dtype=np.float32)
