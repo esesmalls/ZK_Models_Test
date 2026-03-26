@@ -1,0 +1,26 @@
+# ============================================================
+# 数据源注册表
+# format 决定使用哪个 Adapter；未设置则由 detector.py 自动判断
+# ============================================================
+
+sources:
+
+  test_era5:
+    format: era5_flat                    # → core/data/era5_adapter.py
+    root: "/public/home/aciwgvx1jd/new-onescience/onescience/examples/earth/graphcast/test_era5_data"
+    # 若数据使用月份子目录（YYYY_MM/），设为 true
+    use_monthly_subdir: false
+    description: "CEPRI flat ERA5 NetCDF (test_era5_data)，用于初步推理验证"
+    default_pipeline: verify             # 该数据源的默认功能（verify | rolling）
+
+  gundong_20260324:
+    format: gundong_20260324             # → core/data/gundong_adapter.py
+    root: "/public/share/aciwgvx1jd/20260324"
+    description: "业务化 GunDong 格式 ERA5（pressure/pressure/ + surface/）"
+    default_pipeline: rolling
+
+  # ------- 扩展占位：未来新数据源示例 -------
+  # my_custom_data:
+  #   format: era5_flat                  # 复用现有 Adapter，调整 root 即可
+  #   root: "/path/to/my/data"
+  #   default_pipeline: rolling
