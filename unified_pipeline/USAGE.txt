@@ -1,0 +1,21 @@
+本目录 unified_pipeline：统一推理/评估流水线代码（与 ZK_Models 根目录下历史脚本、GunDong_Infer 等隔离）。
+
+路径约定（见 runtime_paths.py）：
+  UNIFIED_PIPELINE_ROOT = 本目录（代码 + config/）
+  ZK_MODELS_ROOT       = 上级 ZK_Models（pangu/ fengwu/ fuxi/ ONNX 权重仍放这里）
+  GRAPH_CAST_ROOT      = graphcast 工程根（conf/ graphcast_model/，运行时会 chdir 到此）
+
+本地快速跑（在 graphcast 工程根上级已就绪的前提下）：
+  cd /path/to/graphcast
+  python ZK_Models/unified_pipeline/run_rolling.py --help
+
+或先进入本目录：
+  cd /path/to/graphcast/ZK_Models/unified_pipeline
+  cd ../..   # 到 graphcast 根（与脚本内部 chdir 一致，也可从任意目录用第一种方式）
+
+Slurm 提交请从本目录调用 scripts/ 下脚本，例如：
+  cd .../unified_pipeline
+  sbatch scripts/submit_rolling.sh
+
+提交五模型 20260303 示例：
+  bash scripts/submit_gundong_20260303_5models.sh

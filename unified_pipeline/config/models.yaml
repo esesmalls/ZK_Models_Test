@@ -1,0 +1,84 @@
+# ============================================================
+# 模型注册表 — 新增模型只需在此追加一个条目
+# 所有路径可用 ${ZK_ROOT} 占位，运行时由 model_registry.py 展开
+# ============================================================
+
+models:
+
+  pangu:
+    enabled: true
+    type: onnx                           # onnx | torch
+    display_name: "Pangu-Weather"
+    paths:
+      6h:  "${ZK_ROOT}/pangu/pangu_weather_6.onnx"
+      24h: "${ZK_ROOT}/pangu/pangu_weather_24.onnx"
+      # 如有 1h/3h 模型，解注释并提供路径
+      # 1h:  "${ZK_ROOT}/pangu/pangu_weather_1.onnx"
+      # 3h:  "${ZK_ROOT}/pangu/pangu_weather_3.onnx"
+    levels: [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+    # 地表变量输出顺序（ONNX output_surface 通道顺序）
+    surface_channels: ["msl", "u10", "v10", "t2m"]
+    pressure_channels: ["z", "q", "t", "u", "v"]
+
+  fengwu:
+    enabled: true
+    type: onnx
+    display_name: "FengWu"
+    paths:
+      v2: "${ZK_ROOT}/fengwu/fengwu_v2.onnx"
+      v1: "${ZK_ROOT}/fengwu/fengwu_v1.onnx"
+    default_version: v2
+    stats_dir: "${ZK_ROOT}/fengwu"      # 存放 data_mean.npy / data_std.npy
+    # input_mode: auto-detected at runtime from ONNX input shape
+    #   single_frame_189ch  — 189 = 4 + 37*5
+    #   dual_frame_138ch    — 138 = 2 * 69 (= 2 * (4+13*5))
+    # 地表通道索引（在 69ch 帧里）: u10=0, v10=1, t2m=2, msl=3
+    surface_channels: ["u10", "v10", "t2m", "msl"]
+
+  fuxi:
+    enabled: true
+    type: onnx
+    display_name: "FuXi"
+    paths:
+      short:  "${ZK_ROOT}/fuxi/short.onnx"
+      medium: "${ZK_ROOT}/fuxi/medium.onnx"
+    default_version: short
+    # FuXi 70 通道：Z13,T13,U13,V13,R13（FUXI_LEVELS 50→1000），然后 T2M(65),U10(66),V10(67),MSL(68),TP(69)
+    surface_channels: ["t2m", "u10", "v10", "msl"]
+    surface_indices:  [65, 66, 67, 68]
+
+  graphcast:
+    enabled: true
+    type: torch
+    display_name: "GraphCast"
+    # config.yaml 里包含 channels、img_size、mesh_level 等所有构图参数
+    model_config: "${GRAPH_ROOT}/conf/config.yaml"
+    model_config_key: "model"
+    checkpoint: "${GRAPH_ROOT}/graphcast_model/graphcast_finetune.pth"
+    stats_dir: "${GRAPH_ROOT}/graphcast_model/stats"     # global_means.npy / global_stds.npy
+    static_dir: "${GRAPH_ROOT}/graphcast_model/static"
+    metadata_json: "${GRAPH_ROOT}/graphcast_model/metadata.json"
+    surface_channels: ["10m_u_component_of_wind", "10m_v_component_of_wind",
+                       "2m_temperature", "mean_sea_level_pressure"]
+
+  graphcast_cs:
+    enabled: true
+    type: torch
+    display_name: "GraphCast_CS"
+    model_config: "${GRAPH_ROOT}/conf/config.yaml"
+    model_config_key: "model"
+    checkpoint: "${GRAPH_ROOT}/graphcast_model_cs/graphcast_finetune.pth"
+    stats_dir: "${GRAPH_ROOT}/graphcast_model_cs/stats"
+    static_dir: "${GRAPH_ROOT}/graphcast_model_cs/static"
+    metadata_json: "${GRAPH_ROOT}/graphcast_model_cs/metadata.json"
+    surface_channels: ["10m_u_component_of_wind", "10m_v_component_of_wind",
+                       "2m_temperature", "mean_sea_level_pressure"]
+
+  # ------- 扩展占位：未来新模型示例 -------
+  # mymodel:
+  #   enabled: false
+  #   type: onnx
+  #   display_name: "MyModel"
+  #   paths:
+  #     default: "${ZK_ROOT}/mymodel/mymodel.onnx"
+  #   surface_channels: ["u10", "v10", "t2m", "msl"]
